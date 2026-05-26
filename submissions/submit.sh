@@ -16,6 +16,7 @@ pwd
 
 START_TIME=$(date +%s)
 
+export HF_TOKEN=$(cat submissions/HF_token.txt)
 uv run python scripts/collect_qk.py
 
 END_TIME=$(date +%s)
