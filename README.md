@@ -1,0 +1,1 @@
+The goal is to look into the heads of gemma 7B. Use `uv sync` to have access to the right dependencies.

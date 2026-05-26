@@ -1,0 +1,33 @@
+[project]
+name = "gemma-explore"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Antoine2212", email = "defirmasa@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.13.0",
+    "datasets>=4.8.5",
+    "einops>=0.8.2",
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "plotly>=6.7.0",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
+    "seaborn>=0.13.2",
+    "torch>=2.12.0",
+    "tqdm>=4.67.3",
+    "transformers>=5.9.0",
+]
+
+[project.scripts]
+gemma-explore = "gemma_explore:main"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
