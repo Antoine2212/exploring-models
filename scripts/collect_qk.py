@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 OUT_DIR = Path("data/cache")
@@ -118,7 +118,9 @@ with torch.no_grad():
             prompt_record["layers"].append(layer_record)
 
             if past_key_values is not None:
-                pk, pv = past_key_values[layer_idx]
+                # DynamicCache moderne : cache stocké dans .layers[idx].keys/.values
+                pk = past_key_values.layers[layer_idx].keys   # [bsz, kv_heads, seq, head_dim]
+                pv = past_key_values.layers[layer_idx].values
                 prompt_record["cache"].append({
                     "k": to_cpu(pk),  # usuellement [bsz, kv_heads, seq, head_dim]
                     "v": to_cpu(pv),
