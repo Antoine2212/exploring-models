@@ -8,12 +8,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 OUT_DIR = Path("data/cache")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_PATH = OUT_DIR / "qwen25_gqa_cache.pt"
+OUT_PATH = OUT_DIR / "chatmode" / "qwen25_gqa_cache.pt"
 
 PROMPTS = [
-    "The quick brown fox jumps over the lazy dog.",
-    "I'm testing attention heads in a small transformer model.",
-    "def add(a, b):\n    return a + b\n",
+    [{"role": "user", "content": "The quick brown fox jumps over the lazy dog."}],
+    [{"role": "user", "content": "I'm testing attention heads in a small transformer model."}],
+    [{"role": "user", "content": "def add(a, b):\n    return a + b\n"}],
 ]
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,7 +65,12 @@ payload: dict[str, Any] = {
 }
 
 with torch.no_grad():
-    for prompt_id, text in enumerate(PROMPTS):
+    for prompt_id, message in enumerate(PROMPTS):
+        text = tokenizer.apply_chat_template(
+            message,
+            tokenize=False,
+            add_generation_prompt=True
+        )
         toks = tokenizer(text, return_tensors="pt")
         input_ids = toks["input_ids"].to(model.device)
         attention_mask = toks["attention_mask"].to(model.device)
