@@ -16,7 +16,9 @@ pwd
 
 START_TIME=$(date +%s)
 
-export HF_TOKEN=$(cat submissions/HF_token.txt)
+export HF_TOKEN=$(cat submissions/HF_token.txt | tr -d '\n\r ')
+echo "Token length: ${#HF_TOKEN}"
+echo "Token starts with: ${HF_TOKEN:0:10}"
 uv run python scripts/collect_qk.py
 
 END_TIME=$(date +%s)
