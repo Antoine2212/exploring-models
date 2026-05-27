@@ -3,15 +3,33 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import math
+import json
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+
+
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
+# -----------------------------------------------------------------------------
+# region 0) Dataclasses
+# -----------------------------------------------------------------------------
+
+
 @dataclass
-class QwenAttentionBundle:
+class QwenBundle:
     model: Any
     tokenizer: Any
     device: torch.device
@@ -22,6 +40,8 @@ class QwenAttentionBundle:
     hidden_size: int
     head_dim: int
     num_frequencies: int
+    rope_theta: float
+    q_group_size: int
 
 
 @dataclass
@@ -45,6 +65,20 @@ class PromptEncoding:
 
 
 @dataclass
+class ScoreOutputs:
+    att_last_col: torch.Tensor
+    swaps: list[tuple[int, int]]
+    blocks: list[tuple[int, int]]
+    pos_scores: torch.Tensor
+    sym_scores: torch.Tensor
+    mean_scores: torch.Tensor
+    tokens: list[str]
+    prompt_token_ids: list[int]
+    prompt_text: str
+    prompt_blocks: list[PromptBlock]
+
+
+@dataclass
 class FrequencyScoreOutputs:
     full_scores: torch.Tensor
     frequency_scores: torch.Tensor
@@ -53,83 +87,86 @@ class FrequencyScoreOutputs:
     swaps: list[tuple[int, int]]
     blocks: list[tuple[int, int]]
     tokens: list[str]
+    prompt_token_ids: list[int]
     prompt_text: str
     prompt_blocks: list[PromptBlock]
 
-@dataclass
-class ScoreOutputs:
-    att_last_col: torch.Tensor
-    swaps: list[tuple[int, int]]
-    blocks: list[tuple[int, int]]
-    pos_scores: torch.Tensor
-    sym_scores: torch.Tensor
-    mean_scores: torch.Tensor
+
+# -----------------------------------------------------------------------------
+# region 1) Model + prompt
+# -----------------------------------------------------------------------------
 
 
-def load_qwen_bundle(
+def load_bundle(
     model_name: str = DEFAULT_MODEL,
     device_map: str = "auto",
     torch_dtype: str | torch.dtype = "auto",
     trust_remote_code: bool = True,
     attn_implementation: str = "eager",
-) -> QwenAttentionBundle:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+) -> QwenBundle:
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=trust_remote_code,
+    )
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map=device_map,
         torch_dtype=torch_dtype,
         trust_remote_code=trust_remote_code,
         attn_implementation=attn_implementation,
-    )
-    model.eval()
+    ).eval()
+
     cfg = model.config
-    head_dim = cfg.hidden_size // cfg.num_attention_heads
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
-    return QwenAttentionBundle(
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    num_heads = cfg.num_attention_heads
+    num_kv_heads = cfg.num_key_value_heads
+
+    return QwenBundle(
         model=model,
         tokenizer=tokenizer,
         device=device,
         dtype=dtype,
         num_layers=cfg.num_hidden_layers,
-        num_heads=cfg.num_attention_heads,
-        num_kv_heads=cfg.num_key_value_heads,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         hidden_size=cfg.hidden_size,
         head_dim=head_dim,
         num_frequencies=head_dim // 2,
+        rope_theta=getattr(cfg, "rope_theta", 1000000.0),
+        q_group_size=num_heads // num_kv_heads,
     )
 
 
-def build_messages(prompt: str, system_prompt: str | None = "You are a helpful assistant.") -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
-    if system_prompt is not None:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-    return messages
-
-
-def encode_prompt(
-    bundle: QwenAttentionBundle,
-    prompt: str,
-    system_prompt: str | None = "You are a helpful assistant.",
-    add_generation_prompt: bool = True,
-) -> PromptEncoding:
-    messages = build_messages(prompt, system_prompt=system_prompt)
+def encode_prompt(bundle: QwenBundle, prompt: str, add_generation_prompt: bool = True) -> PromptEncoding:
+    messages = [{"role": "user", "content": prompt}]
     text = bundle.tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=add_generation_prompt,
     )
+
     enc = bundle.tokenizer(text, return_tensors="pt", add_special_tokens=False)
     input_ids = enc["input_ids"].to(bundle.device)
     attention_mask = enc["attention_mask"].to(bundle.device)
-    tokens = bundle.tokenizer.convert_ids_to_tokens(input_ids[0])
-    blocks = _build_prompt_blocks(
-        bundle,
-        prompt=prompt,
-        system_prompt=system_prompt,
-        add_generation_prompt=add_generation_prompt,
-    )
+    tokens = bundle.tokenizer.convert_ids_to_tokens(input_ids[0].tolist())
+
+    block_ids = input_ids[0].tolist()
+    block_tokens = bundle.tokenizer.convert_ids_to_tokens(block_ids)
+
+    blocks = [
+        PromptBlock(
+            name="chat_template",
+            text=text,
+            token_ids=block_ids,
+            tokens=block_tokens,
+            start=0,
+            end=len(block_ids),
+        )
+    ]
+
     return PromptEncoding(
         messages=messages,
         text=text,
@@ -139,40 +176,182 @@ def encode_prompt(
         blocks=blocks,
     )
 
-def make_blocks(n: int, m: int) -> list[tuple[int, int]]:
-    base, rem = divmod(n, m)
-    blocks = []
+
+# endregion
+
+
+# -----------------------------------------------------------------------------
+# region 1bis) Prompt display helpers
+# -----------------------------------------------------------------------------
+
+
+def _normalize_token_ids(input_ids: torch.Tensor | list[int]) -> list[int]:
+    if isinstance(input_ids, torch.Tensor):
+        if input_ids.ndim == 2:
+            if input_ids.shape[0] != 1:
+                raise ValueError(f"input_ids doit avoir batch_size=1, reçu {tuple(input_ids.shape)}")
+            return input_ids[0].detach().cpu().tolist()
+        if input_ids.ndim == 1:
+            return input_ids.detach().cpu().tolist()
+        raise ValueError(f"input_ids doit être de dimension 1 ou 2, reçu ndim={input_ids.ndim}")
+    return list(input_ids)
+
+
+def print_prompt_with_blocks(
+    tokenizer,
+    input_ids: torch.Tensor | list[int],
+    blocks: list[tuple[int, int]],
+    prefix: str = "# ",
+    show_tokens: bool = False,
+) -> None:
+    """
+    Affiche le prompt réellement envoyé au modèle, découpé bloc par bloc.
+
+    Chaque bloc est imprimé sur une nouvelle ligne avec :
+      - son texte décodé via repr(...) pour rendre visibles les coupures,
+      - son index de bloc,
+      - son intervalle de positions tokenisées [start:end].
+
+    Si show_tokens=True, on affiche aussi les tokens bruts de chaque bloc.
+    """
+    ids = _normalize_token_ids(input_ids)
+
+    print(f"{prefix}Prompt utilisé par le modèle, découpé en {len(blocks)} blocs :")
+    for k, (start, end) in enumerate(blocks):
+        if not (0 <= start <= end <= len(ids)):
+            raise ValueError(
+                f"Bloc invalide #{k}: ({start}, {end}) pour une séquence de longueur {len(ids)}"
+            )
+
+        block_ids = ids[start:end]
+        block_text = tokenizer.decode(block_ids, skip_special_tokens=False)
+        print(f"{repr(block_text)}  # bloc {k}, positions {start}:{end}")
+
+        if show_tokens:
+            block_tokens = tokenizer.convert_ids_to_tokens(block_ids)
+            print(f"{prefix}tokens[{k}] = {block_tokens}")
+
+
+def print_encoding_blocks(
+    bundle: QwenBundle,
+    encoding: PromptEncoding,
+    blocks: list[tuple[int, int]],
+    show_tokens: bool = False,
+    prefix: str = "# ",
+) -> None:
+    print_prompt_with_blocks(
+        tokenizer=bundle.tokenizer,
+        input_ids=encoding.input_ids,
+        blocks=blocks,
+        prefix=prefix,
+        show_tokens=show_tokens,
+    )
+
+
+# endregion
+
+
+# -----------------------------------------------------------------------------
+# region 2) Permutations / swaps
+# -----------------------------------------------------------------------------
+
+
+def split_into_blocks(n_tokens: int, n_blocks: int) -> list[tuple[int, int]]:
+    n_blocks = min(n_blocks, n_tokens)
+    base, rem = divmod(n_tokens, n_blocks)
+    out = []
     start = 0
-    for k in range(m):
-        length = base + (1 if k < rem else 0)
-        blocks.append((start, start + length))
+    for b in range(n_blocks):
+        length = base + (1 if b < rem else 0)
+        out.append((start, start + length))
         start += length
-    return blocks
+    return out
 
 
-def make_swaps(n_blocks: int) -> list[tuple[int, int]]:
+def all_block_swaps(n_blocks: int) -> list[tuple[int, int]]:
     return [(i, j) for i in range(n_blocks - 1) for j in range(i + 1, n_blocks)]
 
 
-def build_swap_permutations(seq_len: int, blocks: list[tuple[int, int]], swaps: list[tuple[int, int]]) -> torch.Tensor:
+def build_swap_indices(seq_len: int, blocks: list[tuple[int, int]], swaps: list[tuple[int, int]]) -> torch.Tensor:
     col_idx = torch.arange(seq_len).unsqueeze(0).expand(len(swaps), -1).clone()
     for k, (bi, bj) in enumerate(swaps):
         si, ei = blocks[bi]
         sj, ej = blocks[bj]
-        li = ei - si
-        lj = ej - sj
-        lmin = min(li, lj)
-        if lmin == 0:
+        li, lj = ei - si, ej - sj
+        if min(li, lj) == 0:
             raise ValueError(f"Empty block in swap ({bi}, {bj}).")
+        lmin = min(li, lj)
         col_idx[k, si:si + lmin] = torch.arange(sj, sj + lmin)
         col_idx[k, sj:sj + lmin] = torch.arange(si, si + lmin)
     return col_idx
 
 
-def get_scores(att_last_col: torch.Tensor, swaps: list[tuple[int, int]], blocks: list[tuple[int, int]], tau: float = 0.1) -> torch.Tensor:
+def permute_input_ids(input_ids: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
+    return input_ids[:, perm]
+
+
+# endregion
+
+
+# -----------------------------------------------------------------------------
+# region 3) Attention extraction
+# -----------------------------------------------------------------------------
+
+
+def get_decoder_layers(bundle: QwenBundle):
+    return bundle.model.model.layers
+
+
+def extract_last_token_attentions(
+    attentions,
+    num_layers: int,
+    num_heads: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if attentions is None or len(attentions) == 0:
+        raise RuntimeError("No attentions returned; use attn_implementation='eager' and output_attentions=True.")
+
+    cols = []
+    for a in attentions:
+        if a is None:
+            raise RuntimeError("A layer returned attention=None.")
+        cols.append(a[0, :, -1, :])
+
+    out = torch.stack(cols, dim=0).to(device=device, dtype=torch.float32)
+    if out.shape != (num_layers, num_heads, seq_len):
+        raise RuntimeError(f"Unexpected attention shape {tuple(out.shape)}")
+    return out
+
+
+@torch.inference_mode()
+def run_model(
+    bundle: QwenBundle,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    output_hidden_states: bool = True,
+    output_attentions: bool = True,
+):
+    return bundle.model.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=output_hidden_states,
+        output_attentions=output_attentions,
+        return_dict=True,
+        use_cache=False,
+    )
+
+
+def get_scores(
+    att_last_col: torch.Tensor,
+    swaps: list[tuple[int, int]],
+    blocks: list[tuple[int, int]],
+    tau: float = 0.1,
+) -> torch.Tensor:
     device = att_last_col.device
     nl, ns, _, nh, seq_len = att_last_col.shape
     n_swaps = len(swaps)
+
     if n_swaps == 0:
         return torch.zeros((nl, nh, ns, 2), device=device, dtype=att_last_col.dtype)
 
@@ -187,27 +366,25 @@ def get_scores(att_last_col: torch.Tensor, swaps: list[tuple[int, int]], blocks:
         token_to_block[s:e] = b
         block_sizes[b] = e - s
 
-    block_sum_base = torch.zeros(nl, ns, nh, m, device=device, dtype=base.dtype)
     idx = token_to_block.view(1, 1, 1, -1).expand(nl, ns, nh, -1)
+    block_sum_base = torch.zeros(nl, ns, nh, m, device=device, dtype=base.dtype)
     block_sum_base.scatter_add_(-1, idx, base)
     block_avg_base = block_sum_base / block_sizes
 
     perms = perms.permute(0, 1, 3, 2, 4)
+
     permuted_block_ids = token_to_block.unsqueeze(0).expand(n_swaps, -1).clone()
     bi = swaps_t[:, 0].unsqueeze(1)
     bj = swaps_t[:, 1].unsqueeze(1)
-    mask_i = permuted_block_ids == bi
-    mask_j = permuted_block_ids == bj
-    permuted_block_ids = torch.where(mask_i, bj, permuted_block_ids)
-    permuted_block_ids = torch.where(mask_j, bi, permuted_block_ids)
+    permuted_block_ids = torch.where(permuted_block_ids == bi, bj, permuted_block_ids)
+    permuted_block_ids = torch.where(permuted_block_ids == bj, bi, permuted_block_ids)
 
     idx_perm = permuted_block_ids.view(1, 1, 1, n_swaps, seq_len).expand(nl, ns, nh, -1, -1)
     block_sum_perm = torch.zeros(nl, ns, nh, n_swaps, m, device=device, dtype=perms.dtype)
     block_sum_perm.scatter_add_(-1, idx_perm, perms)
 
     perm_sizes = block_sizes.unsqueeze(0).expand(n_swaps, -1).clone()
-    bi1 = swaps_t[:, 0]
-    bj1 = swaps_t[:, 1]
+    bi1, bj1 = swaps_t[:, 0], swaps_t[:, 1]
     tmp = perm_sizes[:, bi1].clone()
     perm_sizes[:, bi1] = perm_sizes[:, bj1]
     perm_sizes[:, bj1] = tmp
@@ -227,549 +404,692 @@ def get_scores(att_last_col: torch.Tensor, swaps: list[tuple[int, int]], blocks:
     return torch.stack([pos_scores, sym_scores], dim=-1)
 
 
-def _repeat_kv(x: torch.Tensor, num_groups: int) -> torch.Tensor:
-    if num_groups == 1:
-        return x
-    bsz, n_kv_heads, seq_len, head_dim = x.shape
-    x = x[:, :, None, :, :].expand(bsz, n_kv_heads, num_groups, seq_len, head_dim)
-    return x.reshape(bsz, n_kv_heads * num_groups, seq_len, head_dim)
+@torch.inference_mode()
+def collect_scores(
+    bundle: QwenBundle,
+    prompt: str,
+    n_blocks: int = 16,
+    tau: float = 0.1,
+    verbose_prompt: bool = False,
+    verbose_prompt_tokens: bool = False,
+) -> ScoreOutputs:
+    encoding = encode_prompt(bundle, prompt)
+    seq_len = encoding.input_ids.shape[1]
+    blocks = split_into_blocks(seq_len, n_blocks)
 
+    if verbose_prompt:
+        print_encoding_blocks(
+            bundle=bundle,
+            encoding=encoding,
+            blocks=blocks,
+            show_tokens=verbose_prompt_tokens,
+        )
 
-def _get_decoder_layers(bundle: QwenAttentionBundle):
-    return bundle.model.model.layers
+    swaps = all_block_swaps(len(blocks))
+    col_idx = build_swap_indices(seq_len, blocks, swaps).to(bundle.device)
 
-
-def _get_hidden_states(encoding: PromptEncoding, bundle: QwenAttentionBundle):
-    out = bundle.model.model(
-        input_ids=encoding.input_ids,
-        attention_mask=encoding.attention_mask,
-        output_hidden_states=True,
-        output_attentions=True,
-        return_dict=True,
-        use_cache=False,
+    att_last_col = torch.empty(
+        bundle.num_layers, 1, len(swaps) + 1, bundle.num_heads, seq_len,
+        device=bundle.device, dtype=torch.float32
     )
-    return out.hidden_states[:-1], out
+
+    for swap_idx in range(len(swaps) + 1):
+        ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+        mask = torch.ones_like(ids)
+
+        out = run_model(
+            bundle,
+            input_ids=ids,
+            attention_mask=mask,
+            output_hidden_states=False,
+            output_attentions=True,
+        )
+
+        att_last_col[:, 0, swap_idx] = extract_last_token_attentions(
+            out.attentions,
+            bundle.num_layers,
+            bundle.num_heads,
+            seq_len,
+            bundle.device,
+        )
+
+    scores = get_scores(att_last_col, swaps, blocks, tau=tau).detach().cpu()
+    return ScoreOutputs(
+        att_last_col=att_last_col.detach().cpu(),
+        swaps=swaps,
+        blocks=blocks,
+        pos_scores=scores[..., 0],
+        sym_scores=scores[..., 1],
+        mean_scores=scores.mean(dim=2),
+        tokens=encoding.tokens,
+        prompt_token_ids=encoding.input_ids[0].tolist(),
+        prompt_text=encoding.text,
+        prompt_blocks=encoding.blocks,
+    )
 
 
-def _compute_qk_for_layer(
-    bundle: QwenAttentionBundle,
-    hidden_in: torch.Tensor,
-    layer_idx: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    layer = _get_decoder_layers(bundle)[layer_idx]
+# endregion
+
+
+# -----------------------------------------------------------------------------
+# region 4) RoPE frequency analysis (optimized)
+# -----------------------------------------------------------------------------
+
+
+def rope_wavelengths(bundle: QwenBundle) -> torch.Tensor:
+    idx = torch.arange(bundle.num_frequencies, dtype=torch.float32, device=bundle.device)
+    inv_freq = 1.0 / (bundle.rope_theta ** (idx / bundle.num_frequencies))
+    return (2.0 * math.pi) / inv_freq
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+
+def repeat_kv_local(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    bsz, nkv, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(bsz, nkv, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(bsz, nkv * n_rep, seq_len, head_dim)
+
+
+def compute_qk_for_layer(bundle: QwenBundle, hidden_in: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = get_decoder_layers(bundle)[layer_idx]
     attn = layer.self_attn
 
     bsz, seq_len, _ = hidden_in.shape
     device = attn.q_proj.weight.device
     dtype = attn.q_proj.weight.dtype
 
-    n_heads = bundle.num_heads
-    n_kv_heads = bundle.num_kv_heads
-    head_dim = bundle.head_dim
-    num_kv_groups = n_heads // n_kv_heads
+    x = layer.input_layernorm(hidden_in.to(device=device, dtype=dtype))
 
-    hidden_in = hidden_in.to(device=device, dtype=dtype)
+    q = attn.q_proj(x).view(bsz, seq_len, bundle.num_heads, bundle.head_dim).transpose(1, 2).contiguous()
+    k = attn.k_proj(x).view(bsz, seq_len, bundle.num_kv_heads, bundle.head_dim).transpose(1, 2).contiguous()
 
-    # Qwen2DecoderLayer.forward: input_layernorm avant self_attn
-    hidden_states = layer.input_layernorm(hidden_in)
-
-    q = attn.q_proj(hidden_states)
-    k = attn.k_proj(hidden_states)
-
-    q = q.view(bsz, seq_len, n_heads, head_dim).transpose(1, 2).contiguous()
-    k = k.view(bsz, seq_len, n_kv_heads, head_dim).transpose(1, 2).contiguous()
-
-    # Qwen2Model.forward: position_embeddings = model.rotary_emb(hidden_states, position_ids)
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-    cos, sin = bundle.model.model.rotary_emb(hidden_states, position_ids)
+    cos, sin = bundle.model.model.rotary_emb(x, position_ids)
+    q, k = apply_rotary(q, k, cos, sin)
 
-    # Même logique que apply_rotary_pos_emb dans modeling_qwen2.py
-    q, k = apply_rotary_pos_emb_local(q, k, cos, sin)
-
-    if num_kv_groups > 1:
-        k = _repeat_kv(k, num_kv_groups)
-
+    k = repeat_kv_local(k, bundle.q_group_size)
     return q, k
 
 
-def rotate_half_local(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+def compute_all_frequency_attentions_and_norms(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    half = q.shape[-1] // 2
+
+    q_pairs = torch.stack([q[..., :half], q[..., half:]], dim=-1)
+    k_pairs = torch.stack([k[..., :half], k[..., half:]], dim=-1)
+
+    q_last = q_pairs[:, :, -1]
+    logits = torch.einsum("bhfd,bhtfd->bhft", q_last, k_pairs)
+    logits = logits / math.sqrt(head_dim)
+
+    att = torch.softmax(logits, dim=-1)
+    norms = torch.linalg.vector_norm(logits.float(), ord=2, dim=-1)
+    return att, norms
 
 
-def _encode_text_piece(bundle: QwenAttentionBundle, text: str) -> tuple[list[int], list[str]]:
-    enc = bundle.tokenizer(text, add_special_tokens=False)
-    ids = enc["input_ids"]
-    toks = bundle.tokenizer.convert_ids_to_tokens(ids)
-    return ids, toks
-
-
-def _build_prompt_blocks(
-    bundle: QwenAttentionBundle,
-    prompt: str,
-    system_prompt: str | None,
-    add_generation_prompt: bool,
-) -> list[PromptBlock]:
-    blocks: list[PromptBlock] = []
-    cursor = 0
-
-    if system_prompt is not None:
-        system_text = bundle.tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_prompt}],
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        ids, toks = _encode_text_piece(bundle, system_text)
-        blocks.append(
-            PromptBlock(
-                name="system",
-                text=system_text,
-                token_ids=ids,
-                tokens=toks,
-                start=cursor,
-                end=cursor + len(ids),
-            )
-        )
-        cursor += len(ids)
-
-    user_text = bundle.tokenizer.apply_chat_template(
-        build_messages(prompt, system_prompt=None),
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-    )
-    ids, toks = _encode_text_piece(bundle, user_text)
-    blocks.append(
-        PromptBlock(
-            name="user+assistant_prefix" if add_generation_prompt else "user",
-            text=user_text,
-            token_ids=ids,
-            tokens=toks,
-            start=cursor,
-            end=cursor + len(ids),
-        )
-    )
-    cursor += len(ids)
-
-    return blocks
-
-
-def print_prompt_blocks(encoding: PromptEncoding) -> None:
-    print("=" * 100)
-    print("FINAL PROMPT")
-    print("=" * 100)
-    print(encoding.text)
-    print()
-
-    print("=" * 100)
-    print("PROMPT BLOCKS")
-    print("=" * 100)
-    for block in encoding.blocks:
-        print(f"[{block.name}] tokens {block.start}:{block.end}")
-        print("-" * 100)
-        print(block.text)
-        print()
-        print("TOKENS:")
-        for i, tok in enumerate(block.tokens, start=block.start):
-            print(f"{i:4d} | {tok}")
-        print()
-
-
-def apply_rotary_pos_emb_local(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
-    q_embed = (q * cos) + (rotate_half_local(q) * sin)
-    k_embed = (k * cos) + (rotate_half_local(k) * sin)
-    return q_embed, k_embed
-
-
-def _last_token_attention_from_qk(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    q_last = q[:, :, -1:, :]
-    logits = torch.matmul(q_last, k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
-    return torch.softmax(logits, dim=-1).squeeze(-2)
-
-
-def _frequency_masked_qk(q: torch.Tensor, k: torch.Tensor, freq_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-    d = q.shape[-1]
-    half = d // 2
-    if freq_idx >= half:
-        raise IndexError(f"Frequency index {freq_idx} out of range for head_dim={d}")
-
-    q_sub = torch.zeros_like(q)
-    k_sub = torch.zeros_like(k)
-
-    q_sub[..., freq_idx] = q[..., freq_idx]
-    q_sub[..., half + freq_idx] = q[..., half + freq_idx]
-
-    k_sub[..., freq_idx] = k[..., freq_idx]
-    k_sub[..., half + freq_idx] = k[..., half + freq_idx]
-
-    return q_sub, k_sub
-
-def get_frequency_logit_norms(
-    bundle: QwenAttentionBundle,
-    prompt: str,
-    system_prompt: str | None = "You are a helpful assistant.",
-    per_frequency_l2: bool = True,
-) -> dict[str, Any]:
-    encoding = encode_prompt(bundle, prompt, system_prompt=system_prompt)
-    hidden_states, _ = _get_hidden_states(encoding, bundle)
-    n_freq = bundle.num_frequencies
-    seq_len = encoding.input_ids.shape[1]
-    norms = torch.zeros(bundle.num_layers, bundle.num_heads, n_freq, device=bundle.device, dtype=torch.float32)
-    raw_last_logits = torch.zeros(bundle.num_layers, bundle.num_heads, n_freq, seq_len, device=bundle.device, dtype=torch.float32)
-
-    for layer_idx, hidden_in in enumerate(hidden_states):
-        q, k = _compute_qk_for_layer(bundle, hidden_in, layer_idx)
-        q_last = q[:, :, -1, :]
-        for freq_idx in range(n_freq):
-            start = 2 * freq_idx
-            end = start + 2
-            q_pair = q_last[..., start:end]
-            k_pair = k[..., start:end]
-            logits = torch.einsum("bhd,bhsd->bhs", q_pair, k_pair) / math.sqrt(bundle.head_dim)
-            logits = logits[0].float()
-            raw_last_logits[layer_idx, :, freq_idx] = logits
-            if per_frequency_l2:
-                norms[layer_idx, :, freq_idx] = torch.linalg.vector_norm(logits, ord=2, dim=-1)
-            else:
-                norms[layer_idx, :, freq_idx] = logits.abs().mean(dim=-1)
-    return {
-        "tokens": encoding.tokens,
-        "text": encoding.text,
-        "logit_norms": norms.detach().cpu(),
-        "raw_frequency_logits": raw_last_logits.detach().cpu(),
-    }
-
-
-def _permute_input_ids(input_ids: torch.Tensor, col_idx: torch.Tensor) -> torch.Tensor:
-    return input_ids[:, col_idx]
-
-
-def _extract_last_token_attentions(attentions, num_layers: int, num_heads: int, seq_len: int, device: torch.device) -> torch.Tensor:
-    if attentions is None or len(attentions) == 0:
-        raise RuntimeError(
-            "No attentions were returned by the model. This usually happens when the model was loaded "
-            "with an attention backend that does not materialize attention weights. Reload with "
-            "attn_implementation='eager' and output_attentions=True."
-        )
-    cols = []
-    for a in attentions:
-        if a is None:
-            raise RuntimeError(
-                "A layer returned attention=None. Reload the model with attn_implementation='eager'."
-            )
-        cols.append(a[0, :, -1, :])
-    if len(cols) == 0:
-        raise RuntimeError(
-            "The attentions tuple is empty. Reload the model with attn_implementation='eager'."
-        )
-    out = torch.stack(cols, dim=0).to(device=device, dtype=torch.float32)
-    if out.shape != (num_layers, num_heads, seq_len):
-        raise RuntimeError(
-            f"Unexpected attention shape {tuple(out.shape)}; expected {(num_layers, num_heads, seq_len)}."
-        )
-    return out
-
-
-def collect_last_token_attentions(
-    bundle: QwenAttentionBundle,
-    prompt: str,
-    system_prompt: str | None = "You are a helpful assistant.",
-    n_blocks: int = 16,
-    tau: float = 0.1,
-    verbose_prompt: bool = True,
-) -> ScoreOutputs:
-    encoding = encode_prompt(bundle, prompt, system_prompt=system_prompt)
-    if verbose_prompt:
-        print_prompt_blocks(encoding)
-    seq_len = encoding.input_ids.shape[1]
-    m = min(n_blocks, seq_len)
-    blocks = make_blocks(seq_len, m)
-    swaps = make_swaps(m)
-    col_idx = build_swap_permutations(seq_len, blocks, swaps)
-    n_swaps = len(swaps)
-    att_last_col = torch.zeros(bundle.num_layers, 1, n_swaps + 1, bundle.num_heads, seq_len, device=bundle.device, dtype=torch.float32)
-
-    # CORRECTION : Utiliser _get_hidden_states au lieu de bundle.model() directement
-    base_hidden_states, base_out = _get_hidden_states(encoding, bundle)
-    att_last_col[:, 0, 0] = _extract_last_token_attentions(
-        base_out.attentions,
-        num_layers=bundle.num_layers,
-        num_heads=bundle.num_heads,
-        seq_len=seq_len,
-        device=bundle.device,
-    )
-
-    for k in range(n_swaps):
-        perm_ids = _permute_input_ids(encoding.input_ids, col_idx[k].to(bundle.device))
-        # CORRECTION : Créer un PromptEncoding pour la variante
-        enc_var = PromptEncoding(
-            messages=encoding.messages,
-            text=encoding.text,
-            input_ids=perm_ids,
-            attention_mask=torch.ones_like(perm_ids),
-            tokens=bundle.tokenizer.convert_ids_to_tokens(perm_ids[0]),
-            blocks=encoding.blocks
-        )
-        # CORRECTION : Utiliser _get_hidden_states
-        hidden_states, out = _get_hidden_states(enc_var, bundle)
-        att_last_col[:, 0, k + 1] = _extract_last_token_attentions(
-            out.attentions,
-            num_layers=bundle.num_layers,
-            num_heads=bundle.num_heads,
-            seq_len=seq_len,
-            device=bundle.device,
-        )
-
-    scores = get_scores(att_last_col, swaps, blocks, tau=tau)
-    return ScoreOutputs(
-        att_last_col=att_last_col.detach().cpu(),
-        swaps=swaps,
-        blocks=blocks,
-        pos_scores=scores[..., 0].detach().cpu(),
-        sym_scores=scores[..., 1].detach().cpu(),
-        mean_scores=scores.mean(dim=2).detach().cpu(),
-    )
-
-
+@torch.inference_mode()
 def collect_frequency_scores(
-    bundle: QwenAttentionBundle,
+    bundle: QwenBundle,
     prompt: str,
-    system_prompt: str | None = "You are a helpful assistant.",
     n_blocks: int = 16,
     tau: float = 0.1,
-    verbose_prompt: bool = True,
+    verbose_prompt: bool = False,
+    verbose_prompt_tokens: bool = False,
+    store_full_frequency_tensor: bool = True,
+    freq_chunk_size: int | None = None,
 ) -> FrequencyScoreOutputs:
-    encoding = encode_prompt(bundle, prompt, system_prompt=system_prompt)
-    if verbose_prompt:
-        print_prompt_blocks(encoding)
+    encoding = encode_prompt(bundle, prompt)
     seq_len = encoding.input_ids.shape[1]
-    m = min(n_blocks, seq_len)
-    blocks = make_blocks(seq_len, m)
-    swaps = make_swaps(m)
-    col_idx = build_swap_permutations(seq_len, blocks, swaps)
+    blocks = split_into_blocks(seq_len, n_blocks)
+
+    if verbose_prompt:
+        print_encoding_blocks(
+            bundle=bundle,
+            encoding=encoding,
+            blocks=blocks,
+            show_tokens=verbose_prompt_tokens,
+        )
+
+    swaps = all_block_swaps(len(blocks))
+    col_idx = build_swap_indices(seq_len, blocks, swaps).to(bundle.device)
+
     n_swaps = len(swaps)
-    n_freq = bundle.num_frequencies
+    nl = bundle.num_layers
+    nh = bundle.num_heads
+    nf = bundle.num_frequencies
 
-    full_att_last_col = torch.zeros(
-        bundle.num_layers, 1, n_swaps + 1, bundle.num_heads, seq_len,
-        device=bundle.device, dtype=torch.float32
-    )
-    freq_att_last_col = torch.zeros(
-        bundle.num_layers, 1, n_swaps + 1, bundle.num_heads, n_freq, seq_len,
-        device=bundle.device, dtype=torch.float32
-    )
-    freq_logit_norms = torch.zeros(
-        bundle.num_layers, bundle.num_heads, n_freq,
+    full_att_last_col = torch.empty(
+        nl, 1, n_swaps + 1, nh, seq_len,
         device=bundle.device, dtype=torch.float32
     )
 
-    variants = [encoding.input_ids] + [
-        _permute_input_ids(encoding.input_ids, col_idx[k].to(bundle.device))
-        for k in range(n_swaps)
-    ]
+    freq_logit_norms = torch.empty(
+        nl, nh, nf,
+        device="cpu", dtype=torch.float32
+    )
 
-    for swap_idx, ids in enumerate(variants):
-        enc_var = PromptEncoding(
-            messages=encoding.messages,
-            text=encoding.text,
+    if freq_chunk_size is None:
+        freq_chunk_size = nf
+
+    freq_att_last_col = None
+    if store_full_frequency_tensor:
+        freq_att_last_col = torch.empty(
+            nl, 1, n_swaps + 1, nh, nf, seq_len,
+            device=bundle.device, dtype=torch.float32
+        )
+
+    frequency_scores = torch.empty(
+        nl, nh, nf, 2,
+        device="cpu", dtype=torch.float32
+    )
+
+    for swap_idx in range(n_swaps + 1):
+        ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+        mask = torch.ones_like(ids)
+
+        out = run_model(
+            bundle,
             input_ids=ids,
-            attention_mask=torch.ones_like(ids),
-            tokens=bundle.tokenizer.convert_ids_to_tokens(ids[0]),
-            blocks=encoding.blocks,
+            attention_mask=mask,
+            output_hidden_states=True,
+            output_attentions=True,
         )
-        hidden_states, out = _get_hidden_states(enc_var, bundle)
-        full_att_last_col[:, 0, swap_idx] = _extract_last_token_attentions(
-            out.attentions,
-            num_layers=bundle.num_layers,
-            num_heads=bundle.num_heads,
-            seq_len=seq_len,
-            device=bundle.device,
+
+        full_att_last_col[:, 0, swap_idx] = extract_last_token_attentions(
+            out.attentions, nl, nh, seq_len, bundle.device
         )
+
+        hidden_states = out.hidden_states[:-1]
 
         for layer_idx, hidden_in in enumerate(hidden_states):
-            q, k = _compute_qk_for_layer(bundle, hidden_in, layer_idx)
-            for freq_idx in range(n_freq):
-                q_sub, k_sub = _frequency_masked_qk(q, k, freq_idx)
-                att_sub = _last_token_attention_from_qk(q_sub, k_sub)[0].float()
-                freq_att_last_col[layer_idx, 0, swap_idx, :, freq_idx] = att_sub
+            q, k = compute_qk_for_layer(bundle, hidden_in, layer_idx)
+            att_f, norms_f = compute_all_frequency_attentions_and_norms(q, k, bundle.head_dim)
 
-                if swap_idx == 0:
-                    half = bundle.head_dim // 2
-                    q_last_pair = torch.stack(
-                        [q[0, :, -1, freq_idx], q[0, :, -1, half + freq_idx]],
-                        dim=-1,
-                    )
-                    k_pair = torch.stack(
-                        [k[0, :, :, freq_idx], k[0, :, :, half + freq_idx]],
-                        dim=-1,
-                    )
-                    logits_pair = torch.einsum("hd,hsd->hs", q_last_pair, k_pair) / math.sqrt(bundle.head_dim)
-                    freq_logit_norms[layer_idx, :, freq_idx] = torch.linalg.vector_norm(
-                        logits_pair.float(), ord=2, dim=-1
-                    )
+            if freq_att_last_col is not None:
+                freq_att_last_col[layer_idx, 0, swap_idx] = att_f[0].float()
+
+            if swap_idx == 0:
+                freq_logit_norms[layer_idx] = norms_f[0].float().cpu()
+
+        del out, hidden_states
 
     full_scores = get_scores(full_att_last_col, swaps, blocks, tau=tau).detach().cpu()
+    full_scores = full_scores.squeeze(dim=-2)
 
-    frequency_scores = torch.zeros(
-        bundle.num_layers, bundle.num_heads, n_freq, 2, dtype=torch.float32
-    )
-    for freq_idx in range(n_freq):
-        scores_f = get_scores(freq_att_last_col[..., freq_idx, :], swaps, blocks, tau=tau)
-        frequency_scores[:, :, freq_idx] = scores_f.mean(dim=2).detach().cpu()
+    if freq_att_last_col is not None:
+        freq_flat = freq_att_last_col.permute(0, 1, 2, 4, 3, 5).reshape(
+            nl, 1, n_swaps + 1, nf * nh, seq_len
+        )
+        scores_f = get_scores(freq_flat, swaps, blocks, tau=tau)
+        scores_f = scores_f.mean(dim=2).reshape(nl, nf, nh, 2).permute(0, 2, 1, 3).contiguous()
+        frequency_scores.copy_(scores_f.detach().cpu())
+        del freq_att_last_col, freq_flat, scores_f
 
-    frequency_wavelengths = get_rope_wavelengths(bundle).detach().cpu()
+    else:
+        for f0 in range(0, nf, freq_chunk_size):
+            f1 = min(f0 + freq_chunk_size, nf)
+            chunk = f1 - f0
+
+            freq_chunk_att = torch.empty(
+                nl, 1, n_swaps + 1, nh, chunk, seq_len,
+                device=bundle.device, dtype=torch.float32
+            )
+
+            for swap_idx in range(n_swaps + 1):
+                ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+                mask = torch.ones_like(ids)
+
+                out = run_model(
+                    bundle,
+                    input_ids=ids,
+                    attention_mask=mask,
+                    output_hidden_states=True,
+                    output_attentions=False,
+                )
+                hidden_states = out.hidden_states[:-1]
+
+                for layer_idx, hidden_in in enumerate(hidden_states):
+                    q, k = compute_qk_for_layer(bundle, hidden_in, layer_idx)
+
+                    half = q.shape[-1] // 2
+                    q_pairs = torch.stack([q[..., f0:f1], q[..., half + f0:half + f1]], dim=-1)
+                    k_pairs = torch.stack([k[..., f0:f1], k[..., half + f0:half + f1]], dim=-1)
+
+                    q_last = q_pairs[:, :, -1]
+                    logits = torch.einsum("bhfd,bhtfd->bhft", q_last, k_pairs) / math.sqrt(bundle.head_dim)
+                    att = torch.softmax(logits, dim=-1)
+
+                    freq_chunk_att[layer_idx, 0, swap_idx] = att[0].float()
+
+                del out, hidden_states
+
+            chunk_flat = freq_chunk_att.permute(0, 1, 2, 4, 3, 5).reshape(
+                nl, 1, n_swaps + 1, chunk * nh, seq_len
+            )
+            scores_chunk = get_scores(chunk_flat, swaps, blocks, tau=tau)
+            scores_chunk = scores_chunk.mean(dim=2).reshape(nl, chunk, nh, 2).permute(0, 2, 1, 3).contiguous()
+            frequency_scores[:, :, f0:f1] = scores_chunk.detach().cpu()
+
+            del freq_chunk_att, chunk_flat, scores_chunk
 
     return FrequencyScoreOutputs(
         full_scores=full_scores,
         frequency_scores=frequency_scores,
-        frequency_logit_norms=freq_logit_norms.detach().cpu(),
-        frequency_wavelengths=frequency_wavelengths,
+        frequency_logit_norms=freq_logit_norms,
+        frequency_wavelengths=rope_wavelengths(bundle).detach().cpu(),
         swaps=swaps,
         blocks=blocks,
         tokens=encoding.tokens,
+        prompt_token_ids=encoding.input_ids[0].tolist(),
         prompt_text=encoding.text,
         prompt_blocks=encoding.blocks,
     )
 
-def scores_to_dict(mean_scores: torch.Tensor) -> dict[str, torch.Tensor]:
-    return {"pos": mean_scores[..., 0], "sym": mean_scores[..., 1]}
+
+# endregion
 
 
-def frequency_scores_for_head(
-    freq_outputs: FrequencyScoreOutputs,
-    layer_idx: int,
-    head_idx: int,
-) -> dict[str, torch.Tensor]:
-    arr = freq_outputs.frequency_scores[layer_idx, head_idx]
-    return {
-        "pos": arr[:, 0],
-        "sym": arr[:, 1],
-        "norm": freq_outputs.frequency_logit_norms[layer_idx, head_idx],
-        "wavelength": freq_outputs.frequency_wavelengths,
-    }
-
-def top_heads(mean_scores: torch.Tensor, score_type: str = "pos", k: int = 10) -> list[tuple[int, int, float]]:
-    idx = 0 if score_type == "pos" else 1
-    vals = mean_scores[..., idx]
-    flat = vals.flatten()
-    topv, topi = torch.topk(flat, k=min(k, flat.numel()))
-    n_heads = vals.shape[1]
-    return [(i // n_heads, i % n_heads, float(v)) for v, i in zip(topv.tolist(), topi.tolist())]
+# -----------------------------------------------------------------------------
+# region 5) Plots (matplotlib/seaborn version)
+# -----------------------------------------------------------------------------
 
 
-def plot_head_score_heatmap(mean_scores: torch.Tensor, score_type: str = "pos", ax=None, title: str | None = None):
-    import matplotlib.pyplot as plt
-    idx = 0 if score_type == "pos" else 1
-    arr = mean_scores[..., idx].numpy()
-    if ax is None:
-        _, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(arr, aspect="auto", origin="lower")
-    ax.set_xlabel("Head")
-    ax.set_ylabel("Layer")
-    ax.set_title(title or f"{score_type} score by layer/head")
-    plt.colorbar(im, ax=ax)
-    return ax
+def _as_numpy(x):
+    if torch is not None and isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
-def get_rope_wavelengths(bundle: QwenAttentionBundle) -> torch.Tensor:
-    rope_theta = getattr(bundle.model.config, "rope_theta", 10000.0)
-    n_freq = bundle.num_frequencies
-    idx = torch.arange(n_freq, dtype=torch.float32, device=bundle.device)
 
-    inv_freq = 1.0 / (rope_theta ** (idx / n_freq))
-    wavelengths = (2.0 * math.pi) / inv_freq
-    return wavelengths
+def _layer_head_labels(bundle: QwenBundle):
+    layers = [f"L{l}" for l in range(bundle.num_layers)]
+    heads = [f"H{h}" for h in range(bundle.num_heads)]
+    return layers, heads
 
-def plot_frequency_scores(
-    freq_outputs: FrequencyScoreOutputs,
-    layer_idx: int,
-    head_idx: int,
-    ax=None,
-    title: str | None = None,
-    annotate_wavelengths: bool = True,
+
+def _score_title(prefix: str, n_tokens: int | None = None):
+    """
+    Titre de figure sans le prompt complet.
+    On montre juste le nombre de tokens si on le connaît.
+    """
+    if n_tokens is None:
+        return prefix
+    return f"{prefix} — {n_tokens} tokens"
+
+
+def _prepare_score_matrix(arr, expected_shape: tuple[int, int], name: str):
+    arr = _as_numpy(arr)
+
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    elif arr.ndim != 2:
+        raise ValueError(
+            f"{name} doit avoir la shape [num_layers, num_heads] "
+            f"ou [num_layers, num_heads, 1], reçu {arr.shape}"
+        )
+
+    if arr.shape != expected_shape:
+        raise ValueError(
+            f"{name} a la mauvaise shape: attendu {expected_shape}, reçu {arr.shape}"
+        )
+
+    return np.asarray(arr, dtype=float)
+
+
+def _save_figure_with_meta(fig, save_path: str | None, caption: str, description: str):
+    if not save_path:
+        return
+
+    path = Path(save_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    with open(str(path) + ".meta.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "caption": caption,
+                "description": description,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def _maybe_print_scores_prompt(
+    bundle: QwenBundle,
+    scores: ScoreOutputs,
+    verbose_prompt: bool,
+    verbose_prompt_tokens: bool,
 ):
-    import matplotlib.pyplot as plt
+    if not verbose_prompt:
+        return
 
-    data = frequency_scores_for_head(freq_outputs, layer_idx, head_idx)
-    pos = data["pos"].numpy()
-    sym = data["sym"].numpy()
-    wavelengths = data["wavelength"].numpy()
-    x = list(range(len(pos)))
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(12, 5))
-    else:
-        fig = ax.figure
-
-    ax.plot(x, pos, marker="o", label="pos score")
-    ax.plot(x, sym, marker="s", label="sym score")
-    ax.set_xlabel("Frequency index")
-    ax.set_ylabel("Score")
-    ax.set_title(title or f"Layer {layer_idx}, head {head_idx}")
-    ax.legend()
-    ax.grid(alpha=0.3)
-
-    if annotate_wavelengths:
-        ax2 = ax.twiny()
-        ax2.set_xlim(ax.get_xlim())
-        tick_idx = x
-        tick_labels = [f"{w:.1f}" for w in wavelengths]
-        ax2.set_xticks(tick_idx)
-        ax2.set_xticklabels(tick_labels, rotation=45, ha="left")
-        ax2.set_xlabel("Wavelength (tokens / cycle)")
-
-    fig.tight_layout()
-    return ax
-
-def plot_frequency_logit_norms(freq_outputs: FrequencyScoreOutputs, layer_idx: int, head_idx: int, ax=None, title: str | None = None):
-    import matplotlib.pyplot as plt
-    y = freq_outputs.frequency_logit_norms[layer_idx, head_idx].numpy()
-    x = list(range(len(y)))
-    if ax is None:
-        _, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(x, y, marker="o")
-    ax.set_xlabel("Frequency index")
-    ax.set_ylabel("Logit norm")
-    ax.set_title(title or f"Frequency logit norms, layer {layer_idx}, head {head_idx}")
-    return ax
+    print_prompt_with_blocks(
+        tokenizer=bundle.tokenizer,
+        input_ids=scores.prompt_token_ids,
+        blocks=scores.blocks,
+        show_tokens=verbose_prompt_tokens,
+    )
 
 
-def plot_frequency_scores_and_norms(
-    freq_outputs: FrequencyScoreOutputs,
+def _maybe_print_frequency_prompt(
+    bundle: QwenBundle,
+    freq: FrequencyScoreOutputs,
+    verbose_prompt: bool,
+    verbose_prompt_tokens: bool,
+):
+    if not verbose_prompt:
+        return
+
+    print_prompt_with_blocks(
+        tokenizer=bundle.tokenizer,
+        input_ids=freq.prompt_token_ids,
+        blocks=freq.blocks,
+        show_tokens=verbose_prompt_tokens,
+    )
+
+
+def plot_pos_sym_heatmaps(
+    scores: ScoreOutputs,
+    bundle: QwenBundle,
+    save_path: str | None = None,
+    n_tokens: int | None = None,
+    verbose_prompt: bool = False,
+    verbose_prompt_tokens: bool = False,
+):
+    """
+    Heatmaps des scores positionnel et symbolique par couche et tête.
+
+    Le titre ne montre pas le prompt, juste un indicateur court (ex: nombre de tokens).
+    Le prompt réel est affiché via print() si verbose_prompt=True.
+    """
+    _maybe_print_scores_prompt(
+        bundle=bundle,
+        scores=scores,
+        verbose_prompt=verbose_prompt,
+        verbose_prompt_tokens=verbose_prompt_tokens,
+    )
+
+    layers, heads = _layer_head_labels(bundle)
+    expected_shape = (bundle.num_layers, bundle.num_heads)
+
+    pos = _prepare_score_matrix(scores.pos_scores, expected_shape, "scores.pos_scores")
+    sym = _prepare_score_matrix(scores.sym_scores, expected_shape, "scores.sym_scores")
+
+    sns.set_theme(style="white")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+
+    cmap = mpl.colormaps["viridis"]
+
+    sns.heatmap(
+        pos,
+        xticklabels=heads,
+        yticklabels=layers,
+        ax=axes[0],
+        cmap=cmap,
+        cbar_kws={"label": "Score"},
+        linewidths=0.25,
+        linecolor="white",
+    )
+    axes[0].set_title("Score positionnel")
+    axes[0].set_xlabel("Head")
+    axes[0].set_ylabel("Layer")
+    axes[0].invert_yaxis()
+
+    sns.heatmap(
+        sym,
+        xticklabels=heads,
+        yticklabels=layers,
+        ax=axes[1],
+        cmap=cmap,
+        cbar_kws={"label": "Score"},
+        linewidths=0.25,
+        linecolor="white",
+    )
+    axes[1].set_title("Score symbolique")
+    axes[1].set_xlabel("Head")
+    axes[1].set_ylabel("Layer")
+    axes[1].invert_yaxis()
+
+    if n_tokens is None:
+        n_tokens = len(scores.prompt_token_ids)
+
+    fig.suptitle(_score_title("Scores par couche et tête", n_tokens), fontsize=14)
+
+    _save_figure_with_meta(
+        fig,
+        save_path,
+        caption="Heatmaps des scores positionnel et symbolique",
+        description="Deux heatmaps montrant les scores par couche et par tête.",
+    )
+    return fig
+
+
+def plot_heads_scatter(
+    scores: ScoreOutputs,
+    bundle: QwenBundle,
+    save_path: str | None = None,
+    n_tokens: int | None = None,
+    verbose_prompt: bool = False,
+    verbose_prompt_tokens: bool = False,
+):
+    """
+    Nuage de points des heads dans le plan (score positionnel, score symbolique),
+    coloré par couche.
+
+    Le titre ne montre pas le prompt, juste un indicateur court (ex: nombre de tokens).
+    Le prompt réel est affiché via print() si verbose_prompt=True.
+    """
+    _maybe_print_scores_prompt(
+        bundle=bundle,
+        scores=scores,
+        verbose_prompt=verbose_prompt,
+        verbose_prompt_tokens=verbose_prompt_tokens,
+    )
+
+    expected_shape = (bundle.num_layers, bundle.num_heads)
+
+    pos = _prepare_score_matrix(scores.pos_scores, expected_shape, "scores.pos_scores").reshape(-1)
+    sym = _prepare_score_matrix(scores.sym_scores, expected_shape, "scores.sym_scores").reshape(-1)
+
+    layer_ids = np.repeat(np.arange(bundle.num_layers), bundle.num_heads)
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
+
+    scatter = ax.scatter(
+        pos,
+        sym,
+        c=layer_ids,
+        cmap=mpl.colormaps["viridis"],
+        alpha=0.8,
+        s=45,
+        edgecolors="black",
+        linewidths=0.3,
+    )
+
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("Layer")
+
+    ax.set_xlabel("Score positionnel")
+    ax.set_ylabel("Score symbolique")
+
+    if n_tokens is None:
+        n_tokens = len(scores.prompt_token_ids)
+    ax.set_title(_score_title("Heads dans le plan des scores", n_tokens))
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    _save_figure_with_meta(
+        fig,
+        save_path,
+        caption="Nuage de points des heads",
+        description="Position des heads dans le plan score positionnel-score symbolique, colorées par couche.",
+    )
+    return fig
+
+
+def plot_frequency_analysis(
+    freq: FrequencyScoreOutputs,
     layer_idx: int,
     head_idx: int,
-    title: str | None = None,
+    bundle: QwenBundle,
+    save_path: str | None = None,
+    verbose_prompt: bool = False,
+    verbose_prompt_tokens: bool = False,
 ):
-    import matplotlib.pyplot as plt
+    """
+    Analyse fréquentielle pour une tête donnée dans une seule figure :
+      - haut : scores positionnel et symbolique par index de fréquence
+      - bas  : normes par index de fréquence
 
-    data = frequency_scores_for_head(freq_outputs, layer_idx, head_idx)
-    pos = data["pos"].numpy()
-    sym = data["sym"].numpy()
-    norm = data["norm"].numpy()
-    wavelengths = data["wavelength"].numpy()
-    x = list(range(len(pos)))
+    Le titre affiche les vrais scores globaux de la tête étudiée
+    (positionnel et symbolique), sans le prompt.
+    Le prompt réel est affiché via print() si verbose_prompt=True.
+    """
+    _maybe_print_frequency_prompt(
+        bundle=bundle,
+        freq=freq,
+        verbose_prompt=verbose_prompt,
+        verbose_prompt_tokens=verbose_prompt_tokens,
+    )
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    wavelengths = np.asarray(_as_numpy(freq.frequency_wavelengths), dtype=float)
 
-    axes[0].plot(x, pos, marker="o", label="pos")
-    axes[0].plot(x, sym, marker="s", label="sym")
-    axes[0].set_ylabel("Score")
-    axes[0].legend()
-    axes[0].grid(alpha=0.3)
-    axes[0].set_title(title or f"Layer {layer_idx}, head {head_idx}")
+    freq_scores = np.asarray(_as_numpy(freq.frequency_scores), dtype=float)
+    norm_all = np.asarray(_as_numpy(freq.frequency_logit_norms), dtype=float)
+    full_scores = np.asarray(_as_numpy(freq.full_scores), dtype=float)
 
-    axes[1].plot(x, norm, marker="^", color="tab:purple", label="logit norm")
-    axes[1].set_xlabel("Frequency index")
-    axes[1].set_ylabel("Logit norm")
-    axes[1].legend()
-    axes[1].grid(alpha=0.3)
+    if not (0 <= layer_idx < bundle.num_layers):
+        raise IndexError(f"layer_idx={layer_idx} hors limites pour {bundle.num_layers} couches")
+    if not (0 <= head_idx < bundle.num_heads):
+        raise IndexError(f"head_idx={head_idx} hors limites pour {bundle.num_heads} têtes")
 
-    ax_top = axes[0].twiny()
-    ax_top.set_xlim(axes[0].get_xlim())
-    ax_top.set_xticks(x)
-    ax_top.set_xticklabels([f"{w:.1f}" for w in wavelengths], rotation=45, ha="left")
-    ax_top.set_xlabel("Wavelength (tokens / cycle)")
+    if (
+        freq_scores.ndim != 4
+        or freq_scores.shape[:2] != (bundle.num_layers, bundle.num_heads)
+        or freq_scores.shape[-1] != 2
+    ):
+        raise ValueError(
+            "freq.frequency_scores doit avoir la shape "
+            f"[num_layers, num_heads, num_freq, 2], reçu {freq_scores.shape}"
+        )
 
-    fig.tight_layout()
-    return axes
+    if norm_all.ndim != 3 or norm_all.shape[:2] != (bundle.num_layers, bundle.num_heads):
+        raise ValueError(
+            "freq.frequency_logit_norms doit avoir la shape "
+            f"[num_layers, num_heads, num_freq], reçu {norm_all.shape}"
+        )
+
+    if full_scores.ndim != 3 or full_scores.shape != (bundle.num_layers, bundle.num_heads, 2):
+        raise ValueError(
+            "freq.full_scores doit avoir la shape "
+            f"[num_layers, num_heads, 2], reçu {full_scores.shape}"
+        )
+
+    if len(wavelengths) != freq_scores.shape[2] or len(wavelengths) != norm_all.shape[2]:
+        raise ValueError(
+            "Incohérence entre le nombre de wavelengths et le nombre de fréquences "
+            f"({len(wavelengths)} vs {freq_scores.shape[2]} vs {norm_all.shape[2]})"
+        )
+
+    head_freq_scores = freq_scores[layer_idx, head_idx]
+    norm_mean = norm_all.mean(axis=(0, 1))
+    norm_orig = norm_all[layer_idx, head_idx]
+
+    head_full_score = full_scores[layer_idx, head_idx]
+    head_pos_score = float(head_full_score[0])
+    head_sym_score = float(head_full_score[1])
+
+    x = np.arange(len(wavelengths))
+
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(13, 8.5),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.2, 1.0]},
+        constrained_layout=True,
+    )
+    ax1, ax2 = axes
+
+    ax1.plot(
+        x, head_freq_scores[:, 0],
+        marker="o", markersize=4, linewidth=1.8,
+        label="Positionnel"
+    )
+    ax1.plot(
+        x, head_freq_scores[:, 1],
+        marker="s", markersize=4, linewidth=1.8,
+        label="Symbolique"
+    )
+    ax1.set_ylabel("Score")
+    ax1.set_title("Scores par fréquence")
+    ax1.grid(True, linestyle="--", alpha=0.3)
+    ax1.legend(loc="best")
+
+    ax2.plot(
+        x, norm_mean,
+        marker="o", markersize=4, linewidth=1.8,
+        label="Norme moyenne"
+    )
+    ax2.plot(
+        x, norm_orig,
+        marker="s", markersize=4, linewidth=1.8,
+        label="Norme origine"
+    )
+    ax2.set_xlabel("Fréquence (index et longueur d'onde)")
+    ax2.set_ylabel("Norme")
+    ax2.set_title("Normes par fréquence")
+    ax2.grid(True, linestyle="--", alpha=0.3)
+    ax2.legend(loc="best")
+
+    tick_labels = [f"{i} | λ={w:.2g}" for i, w in enumerate(wavelengths)]
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(
+        tick_labels,
+        rotation=45,
+        ha="right",
+        rotation_mode="anchor",
+        fontsize=8,
+    )
+
+    fig.suptitle(
+        (
+            f"Analyse fréquentielle — Couche {layer_idx}, tête {head_idx} | "
+            f"score positionnel={head_pos_score:.4f} | "
+            f"score symbolique={head_sym_score:.4f}"
+        ),
+        fontsize=13,
+    )
+
+    _save_figure_with_meta(
+        fig,
+        save_path,
+        caption="Analyse fréquentielle d'une tête",
+        description=(
+            "Figure unique avec scores positionnel et symbolique par fréquence, "
+            "ainsi que les normes par index de fréquence. Le titre affiche les "
+            "vrais scores globaux positionnel et symbolique de la tête étudiée, "
+            "sans le prompt."
+        ),
+    )
+
+    return fig, head_pos_score, head_sym_score
+
+
+# endregion
