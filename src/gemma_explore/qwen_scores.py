@@ -627,7 +627,6 @@ def collect_frequency_scores(
     tau: float = 0.1,
     verbose_prompt: bool = False,
     verbose_prompt_tokens: bool = False,
-    store_full_frequency_tensor: bool = True,
     freq_chunk_size: int | None = None,
 ) -> FrequencyScoreOutputs:
     """Calcule les scores globaux et fréquentiels pour un prompt donné.
@@ -669,11 +668,11 @@ def collect_frequency_scores(
         freq_chunk_size = nf
 
     freq_att_last_col = None
-    if store_full_frequency_tensor:
-        freq_att_last_col = torch.empty(
-            nl, 1, n_swaps + 1, nh, nf, seq_len,
-            device=bundle.device, dtype=torch.float32
-        )
+
+    freq_att_last_col = torch.empty(
+        nl, 1, n_swaps + 1, nh, nf, seq_len,
+        device=bundle.device, dtype=torch.float32
+    )
 
     frequency_scores = torch.empty(
         nl, nh, nf, 2,
@@ -726,63 +725,7 @@ def collect_frequency_scores(
         scores_f = scores_f.squeeze(dim=2).reshape(nl, nf, nh, 2).permute(0, 2, 1, 3).contiguous()
         frequency_scores.copy_(scores_f.detach().cpu())
         del freq_att_last_col, freq_flat, scores_f
-    else:
-        # Variante mémoire-frugale : traitement par paquets de fréquences.
-        for f0 in range(0, nf, freq_chunk_size):
-            f1 = min(f0 + freq_chunk_size, nf)
-            chunk = f1 - f0
-
-            freq_chunk_att = torch.empty(
-                nl, 1, n_swaps + 1, nh, chunk, seq_len,
-                device=bundle.device, dtype=torch.float32
-            )
-
-            for swap_idx in range(n_swaps + 1):
-                ids = (
-                    encoding.input_ids
-                    if swap_idx == 0
-                    else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
-                )
-                mask = torch.ones_like(ids)
-
-                out = run_model(
-                    bundle,
-                    input_ids=ids,
-                    attention_mask=mask,
-                    output_hidden_states=True,
-                    output_attentions=False,
-                )
-                hidden_states = out.hidden_states[:-1]
-
-                for layer_idx, hidden_in in enumerate(hidden_states):
-                    q, k = compute_qk_for_layer(bundle, hidden_in, layer_idx)
-
-                    half = q.shape[-1] // 2
-                    q_pairs = torch.stack(
-                        [q[..., f0:f1], q[..., half + f0:half + f1]], dim=-1
-                    )
-                    k_pairs = torch.stack(
-                        [k[..., f0:f1], k[..., half + f0:half + f1]], dim=-1
-                    )
-
-                    q_last = q_pairs[:, :, -1]
-                    logits = torch.einsum("bhfd,bhtfd->bhft", q_last, k_pairs)
-                    logits = logits / math.sqrt(bundle.head_dim)
-                    att = torch.softmax(logits, dim=-1)
-
-                    freq_chunk_att[layer_idx, 0, swap_idx] = att[0].float()
-
-                del out, hidden_states
-
-            chunk_flat = freq_chunk_att.permute(0, 1, 2, 4, 3, 5).reshape(
-                nl, 1, n_swaps + 1, chunk * nh, seq_len
-            )
-            scores_chunk = get_scores(chunk_flat, swaps, blocks, tau=tau)
-            scores_chunk = scores_chunk.mean(dim=2).reshape(nl, chunk, nh, 2).permute(0, 2, 1, 3).contiguous()
-            frequency_scores[:, :, f0:f1] = scores_chunk.detach().cpu()
-
-            del freq_chunk_att, chunk_flat, scores_chunk
-
+    
     return FrequencyScoreOutputs(
         full_scores=full_scores,
         frequency_scores=frequency_scores,
