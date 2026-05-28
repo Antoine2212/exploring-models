@@ -11,7 +11,7 @@ import numpy as np
 import seaborn as sns
 import torch
 
-from qwen_cache import CacheHandle, get_layer_record, get_prompt_record
+from gemma_explore.qwen_cache import CacheHandle, get_layer_record, get_prompt_record
 
 
 # ---------------------------------------------------------------------
