@@ -22,13 +22,12 @@ echo "Token starts with: ${HF_TOKEN:0:10}"
 
 export PYTHONUNBUFFERED=1
 
-uv run python -u scripts/ruler_eval_qwen.py \
-  --model Qwen/Qwen2.5-0.5B-Instruct \
-  --backend vllm \
-  --device cuda \
-  --max-length 32768 \
-  --limit 20 \
-  --batch-size 1
+source /home/antoine_df/gemma_explore/.venv/bin/activate
+
+
+
+# Exécuter avec python direct (pas uv run)
+python scripts/build_cache.py
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
