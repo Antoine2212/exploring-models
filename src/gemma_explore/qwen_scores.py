@@ -58,7 +58,7 @@ class PromptBlock:
 @dataclass
 class PromptEncoding:
     """Encodage complet d’un prompt chat prêt à être injecté au modèle."""
-    messages: list[dict[str, str]]
+    messages: list[dict[str, str]] | None
     text: str
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
@@ -80,7 +80,6 @@ class ScoreOutputs:
     prompt_text: str
     prompt_blocks: list[PromptBlock]
 
-
 @dataclass
 class FrequencyScoreOutputs:
     """Sorties de l’analyse fréquentielle RoPE par couche, tête et fréquence."""
@@ -88,13 +87,13 @@ class FrequencyScoreOutputs:
     frequency_scores: torch.Tensor
     frequency_logit_norms: torch.Tensor
     frequency_wavelengths: torch.Tensor
+    attention_matrix: torch.Tensor
     swaps: list[tuple[int, int]]
     blocks: list[tuple[int, int]]
     tokens: list[str]
     prompt_token_ids: list[int]
     prompt_text: str
     prompt_blocks: list[PromptBlock]
-
 
 # -----------------------------------------------------------------------------
 # 1) Model + prompt
@@ -151,19 +150,27 @@ def load_bundle(
 def encode_prompt(
     bundle: QwenBundle,
     prompt: str,
+    apply_chat_template: bool = True,
     add_generation_prompt: bool = True,
 ) -> PromptEncoding:
-    """Applique le chat template puis tokenise le prompt.
+    """Applique éventuellement le chat template puis tokenise le prompt.
 
     Le résultat contient le texte exact envoyé au modèle, les tokens
     associés et un bloc unique couvrant toute la séquence.
     """
-    messages = [{"role": "user", "content": prompt}]
-    text = bundle.tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-    )
+    messages = None
+
+    if apply_chat_template:
+        messages = [{"role": "user", "content": prompt}]
+        text = bundle.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+        block_name = "chat_template"
+    else:
+        text = prompt
+        block_name = "raw_prompt"
 
     enc = bundle.tokenizer(text, return_tensors="pt", add_special_tokens=False)
     input_ids = enc["input_ids"].to(bundle.device)
@@ -175,7 +182,7 @@ def encode_prompt(
 
     blocks = [
         PromptBlock(
-            name="chat_template",
+            name=block_name,
             text=text,
             token_ids=block_ids,
             tokens=block_tokens,
@@ -313,13 +320,39 @@ def permute_input_ids(input_ids: torch.Tensor, perm: torch.Tensor) -> torch.Tens
 
 
 # -----------------------------------------------------------------------------
-# 3) Attention extraction
+#  region 3) Attention extraction
 # -----------------------------------------------------------------------------
 
 def get_decoder_layers(bundle: QwenBundle):
     """Retourne la liste des couches du décodeur."""
     return bundle.model.model.layers
 
+def extract_full_attention_matrices(
+    attentions,
+    num_layers: int,
+    num_heads: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Extrait les matrices d’attention complètes pour toutes les couches.
+
+    Retourne un tenseur de shape [num_layers, num_heads, seq_len, seq_len].
+    """
+    if attentions is None or len(attentions) == 0:
+        raise RuntimeError(
+            "No attentions returned; use attn_implementation='eager' and output_attentions=True."
+        )
+
+    mats = []
+    for a in attentions:
+        if a is None:
+            raise RuntimeError("A layer returned attention=None.")
+        mats.append(a[0])
+
+    out = torch.stack(mats, dim=0).to(device=device, dtype=torch.float32)
+    if out.shape != (num_layers, num_heads, seq_len, seq_len):
+        raise RuntimeError(f"Unexpected full attention shape {tuple(out.shape)}")
+    return out
 
 def extract_last_token_attentions(
     attentions,
@@ -327,7 +360,7 @@ def extract_last_token_attentions(
     num_heads: int,
     seq_len: int,
     device: torch.device,
-) -> torch.Tensor:
+    ) -> torch.Tensor:
     """Extrait l’attention du dernier token vers toute la séquence.
 
     Retourne un tenseur de shape [num_layers, num_heads, seq_len].
@@ -454,6 +487,7 @@ def collect_scores(
     tau: float = 0.1,
     verbose_prompt: bool = False,
     verbose_prompt_tokens: bool = False,
+    apply_chat_template: bool = True,
 ) -> ScoreOutputs:
     """Calcule les scores globaux positionnel/symbolique pour un prompt.
 
@@ -461,7 +495,7 @@ def collect_scores(
     extrait l’attention du dernier token, puis agrège les scores par couche
     et par tête.
     """
-    encoding = encode_prompt(bundle, prompt)
+    encoding = encode_prompt(bundle, prompt, apply_chat_template=apply_chat_template)
     seq_len = encoding.input_ids.shape[1]
     blocks = split_into_blocks(seq_len, n_blocks)
 
@@ -524,6 +558,7 @@ def collect_scores(
         prompt_blocks=encoding.blocks,
     )
 
+# endregion
 
 # -----------------------------------------------------------------------------
 # 4) RoPE frequency analysis
@@ -627,14 +662,14 @@ def collect_frequency_scores(
     tau: float = 0.1,
     verbose_prompt: bool = False,
     verbose_prompt_tokens: bool = False,
-    freq_chunk_size: int | None = None,
+    apply_chat_template: bool = True,
 ) -> FrequencyScoreOutputs:
     """Calcule les scores globaux et fréquentiels pour un prompt donné.
 
-    Selon store_full_frequency_tensor, l’analyse fréquentielle est faite
-    en une passe complète ou par chunks pour réduire l’usage mémoire.
+    Stocke aussi la matrice d’attention complète du prompt original
+    pour permettre son affichage sous forme de heatmap seq_len x seq_len.
     """
-    encoding = encode_prompt(bundle, prompt)
+    encoding = encode_prompt(bundle, prompt, apply_chat_template=apply_chat_template)
     seq_len = encoding.input_ids.shape[1]
     blocks = split_into_blocks(seq_len, n_blocks)
 
@@ -664,11 +699,6 @@ def collect_frequency_scores(
         device="cpu", dtype=torch.float32
     )
 
-    if freq_chunk_size is None:
-        freq_chunk_size = nf
-
-    freq_att_last_col = None
-
     freq_att_last_col = torch.empty(
         nl, 1, n_swaps + 1, nh, nf, seq_len,
         device=bundle.device, dtype=torch.float32
@@ -678,6 +708,8 @@ def collect_frequency_scores(
         nl, nh, nf, 2,
         device="cpu", dtype=torch.float32
     )
+
+    attention_matrix = None
 
     for swap_idx in range(n_swaps + 1):
         ids = (
@@ -699,6 +731,11 @@ def collect_frequency_scores(
             out.attentions, nl, nh, seq_len, bundle.device
         )
 
+        if swap_idx == 0:
+            attention_matrix = extract_full_attention_matrices(
+                out.attentions, nl, nh, seq_len, bundle.device
+            ).detach().cpu()
+
         hidden_states = out.hidden_states[:-1]
 
         for layer_idx, hidden_in in enumerate(hidden_states):
@@ -707,9 +744,7 @@ def collect_frequency_scores(
                 q, k, bundle.head_dim
             )
 
-            if freq_att_last_col is not None:
-                freq_att_last_col[layer_idx, 0, swap_idx] = att_f[0].float()
-
+            freq_att_last_col[layer_idx, 0, swap_idx] = att_f[0].float()
             freq_logit_norms[layer_idx, swap_idx] = norms_f[0].float().cpu()
 
         del out, hidden_states
@@ -717,20 +752,24 @@ def collect_frequency_scores(
     full_scores = get_scores(full_att_last_col, swaps, blocks, tau=tau).detach().cpu()
     full_scores = full_scores.squeeze(dim=-2)
 
-    if freq_att_last_col is not None:
-        freq_flat = freq_att_last_col.permute(0, 1, 2, 4, 3, 5).reshape(
-            nl, 1, n_swaps + 1, nf * nh, seq_len
-        )
-        scores_f = get_scores(freq_flat, swaps, blocks, tau=tau)
-        scores_f = scores_f.squeeze(dim=2).reshape(nl, nf, nh, 2).permute(0, 2, 1, 3).contiguous()
-        frequency_scores.copy_(scores_f.detach().cpu())
-        del freq_att_last_col, freq_flat, scores_f
-    
+    freq_flat = freq_att_last_col.permute(0, 1, 2, 4, 3, 5).reshape(
+        nl, 1, n_swaps + 1, nf * nh, seq_len
+    )
+    scores_f = get_scores(freq_flat, swaps, blocks, tau=tau)
+    scores_f = scores_f.squeeze(dim=2).reshape(nl, nf, nh, 2).permute(0, 2, 1, 3).contiguous()
+    frequency_scores.copy_(scores_f.detach().cpu())
+
+    del freq_att_last_col, freq_flat, scores_f
+
+    if attention_matrix is None:
+        raise RuntimeError("attention_matrix n'a pas pu être extraite pour le prompt original.")
+
     return FrequencyScoreOutputs(
         full_scores=full_scores,
         frequency_scores=frequency_scores,
         frequency_logit_norms=freq_logit_norms,
         frequency_wavelengths=rope_wavelengths(bundle).detach().cpu(),
+        attention_matrix=attention_matrix,
         swaps=swaps,
         blocks=blocks,
         tokens=encoding.tokens,
@@ -738,7 +777,7 @@ def collect_frequency_scores(
         prompt_text=encoding.text,
         prompt_blocks=encoding.blocks,
     )
-
+    
 
 # -----------------------------------------------------------------------------
 # 5) Plots
@@ -986,10 +1025,11 @@ def plot_frequency_analysis(
     verbose_prompt: bool = False,
     verbose_prompt_tokens: bool = False,
 ):
-    """Visualise les scores et normes fréquentiels d’une tête donnée.
+    """Visualise les scores fréquentiels, les normes, et la heatmap d’attention complète.
 
-    La figure contient les scores par fréquence en haut, puis les normes
-    de logits en bas, avec rappel des scores globaux dans le titre.
+    La heatmap représente la matrice d’attention seq_len x seq_len du prompt
+    original pour la couche et la tête demandées, avec en (i, j) l’attention
+    de la query i vers la key j. La partie supérieure est nulle à cause du masque causal.
     """
     _maybe_print_frequency_prompt(
         bundle=bundle,
@@ -1002,6 +1042,7 @@ def plot_frequency_analysis(
     freq_scores = np.asarray(_as_numpy(freq.frequency_scores), dtype=float)
     norm_all = np.asarray(_as_numpy(freq.frequency_logit_norms), dtype=float)
     full_scores = np.asarray(_as_numpy(freq.full_scores), dtype=float)
+    attention_matrix = np.asarray(_as_numpy(freq.attention_matrix), dtype=float)
 
     if not (0 <= layer_idx < bundle.num_layers):
         raise IndexError(f"layer_idx={layer_idx} hors limites pour {bundle.num_layers} couches")
@@ -1018,7 +1059,11 @@ def plot_frequency_analysis(
             f"[num_layers, num_heads, num_freq, 2], reçu {freq_scores.shape}"
         )
 
-    if (norm_all.ndim != 4 or norm_all.shape[0] != bundle.num_layers or norm_all.shape[2] != bundle.num_heads):
+    if (
+        norm_all.ndim != 4
+        or norm_all.shape[0] != bundle.num_layers
+        or norm_all.shape[2] != bundle.num_heads
+    ):
         raise ValueError(
             "freq.frequency_logit_norms doit avoir la shape "
             f"[num_layers, n_swaps + 1, num_heads, num_freq], reçu {norm_all.shape}"
@@ -1028,6 +1073,15 @@ def plot_frequency_analysis(
         raise ValueError(
             "freq.full_scores doit avoir la shape "
             f"[num_layers, num_heads, 2], reçu {full_scores.shape}"
+        )
+
+    if (
+        attention_matrix.ndim != 4
+        or attention_matrix.shape != (bundle.num_layers, bundle.num_heads, len(freq.tokens), len(freq.tokens))
+    ):
+        raise ValueError(
+            "freq.attention_matrix doit avoir la shape "
+            f"[num_layers, num_heads, seq_len, seq_len], reçu {attention_matrix.shape}"
         )
 
     if len(wavelengths) != freq_scores.shape[2] or len(wavelengths) != norm_all.shape[3]:
@@ -1044,19 +1098,39 @@ def plot_frequency_analysis(
     head_pos_score = float(head_full_score[0])
     head_sym_score = float(head_full_score[1])
 
+    att_map = attention_matrix[layer_idx, head_idx]
+    seq_len = att_map.shape[0]
     x = np.arange(len(wavelengths))
+    tick_labels = [f"{i} | λ={w:.2g}" for i, w in enumerate(wavelengths)]
+
+    tokens = freq.tokens
+    max_labels = 60
+    if seq_len <= max_labels:
+        heat_xticks = np.arange(seq_len)
+        heat_yticks = np.arange(seq_len)
+        heat_xticklabels = tokens
+        heat_yticklabels = tokens
+    else:
+        step = int(np.ceil(seq_len / max_labels))
+        heat_xticks = np.arange(0, seq_len, step)
+        heat_yticks = np.arange(0, seq_len, step)
+        heat_xticklabels = [tokens[i] for i in heat_xticks]
+        heat_yticklabels = [tokens[i] for i in heat_yticks]
 
     sns.set_theme(style="whitegrid")
-    fig, axes = plt.subplots(
-        2,
-        1,
-        figsize=(13, 8.5),
-        sharex=True,
-        gridspec_kw={"height_ratios": [1.2, 1.0]},
-        constrained_layout=True,
-    )
-    ax1, ax2 = axes
 
+    fig = plt.figure(figsize=(16, 9), constrained_layout=True)
+    gs = fig.add_gridspec(
+        2, 2,
+        width_ratios=[1.35, 1.0],
+        height_ratios=[1.0, 1.0],
+    )
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+    ax3 = fig.add_subplot(gs[:, 1])   # prend toute la colonne de droite
+
+    # --- ax1 : scores fréquentiels
     ax1.plot(
         x, head_freq_scores[:, 0],
         marker="o", markersize=4, linewidth=1.8,
@@ -1068,10 +1142,14 @@ def plot_frequency_analysis(
         label="Symbolique"
     )
     ax1.set_ylabel("Score")
-    ax1.set_title("Scores par fréquence")
+    ax1.set_title("Scores par fréquence", pad=10)
     ax1.grid(True, linestyle="--", alpha=0.3)
     ax1.legend(loc="best")
 
+    # masque les labels x sur ax1 pour éviter tout conflit visuel
+    ax1.tick_params(axis="x", labelbottom=False)
+
+    # --- ax2 : normes
     ax2.plot(
         x, norm_mean,
         marker="o", markersize=4, linewidth=1.8,
@@ -1082,13 +1160,12 @@ def plot_frequency_analysis(
         marker="s", markersize=4, linewidth=1.8,
         label="Norme origine"
     )
-    ax2.set_xlabel("Fréquence (index et longueur d'onde)")
     ax2.set_ylabel("Norme")
-    ax2.set_title("Normes par fréquence")
+    ax2.set_xlabel("Fréquence (index et longueur d'onde)")
+    ax2.set_title("Normes par fréquence", pad=14)
     ax2.grid(True, linestyle="--", alpha=0.3)
     ax2.legend(loc="best")
 
-    tick_labels = [f"{i} | λ={w:.2g}" for i, w in enumerate(wavelengths)]
     ax2.set_xticks(x)
     ax2.set_xticklabels(
         tick_labels,
@@ -1097,6 +1174,27 @@ def plot_frequency_analysis(
         rotation_mode="anchor",
         fontsize=8,
     )
+
+    # --- ax3 : heatmap carrée
+    sns.heatmap(
+        att_map,
+        ax=ax3,
+        cmap=mpl.colormaps["magma"],
+        cbar_kws={"label": "Poids d'attention"},
+        xticklabels=False,
+        yticklabels=False,
+        square=True,   # cellules carrées
+    )
+
+    ax3.set_box_aspect(1)  # axe physiquement carré
+    ax3.set_title("Heatmap d'attention complète sur le prompt", pad=10)
+    ax3.set_xlabel("Key position / token")
+    ax3.set_ylabel("Query position / token")
+
+    ax3.set_xticks(heat_xticks + 0.5)
+    ax3.set_yticks(heat_yticks + 0.5)
+    ax3.set_xticklabels(heat_xticklabels, rotation=90, fontsize=7)
+    ax3.set_yticklabels(heat_yticklabels, rotation=0, fontsize=7)
 
     fig.suptitle(
         (
@@ -1110,10 +1208,10 @@ def plot_frequency_analysis(
     _save_figure_with_meta(
         fig,
         save_path,
-        caption="Analyse fréquentielle d'une tête",
+        caption="Analyse fréquentielle et heatmap d'attention d'une tête",
         description=(
-            "Figure unique avec scores positionnel et symbolique par fréquence, "
-            "ainsi que les normes par index de fréquence."
+            "Figure avec scores fréquentiels, normes de logits et matrice "
+            "d'attention complète seq_len x seq_len pour le prompt original."
         ),
     )
 
