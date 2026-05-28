@@ -26,7 +26,7 @@ def short_tok(token: str, max_len: int = 18) -> str:
 
 def _as_numpy(x: Any) -> np.ndarray:
     if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
+        return x.detach().cpu().float().numpy()
     return np.asarray(x)
 
 
