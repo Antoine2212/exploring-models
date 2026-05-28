@@ -24,12 +24,12 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
 # -----------------------------------------------------------------------------
-# region 0) Dataclasses
+# 0) Dataclasses
 # -----------------------------------------------------------------------------
-
 
 @dataclass
 class QwenBundle:
+    """Conteneur des objets modèle/tokenizer et des hyperparamètres utiles."""
     model: Any
     tokenizer: Any
     device: torch.device
@@ -46,6 +46,7 @@ class QwenBundle:
 
 @dataclass
 class PromptBlock:
+    """Bloc textuel/tokenisé du prompt, avec bornes dans la séquence."""
     name: str
     text: str
     token_ids: list[int]
@@ -56,6 +57,7 @@ class PromptBlock:
 
 @dataclass
 class PromptEncoding:
+    """Encodage complet d’un prompt chat prêt à être injecté au modèle."""
     messages: list[dict[str, str]]
     text: str
     input_ids: torch.Tensor
@@ -66,6 +68,7 @@ class PromptEncoding:
 
 @dataclass
 class ScoreOutputs:
+    """Sorties agrégées de l’analyse par swaps de blocs sur l’attention."""
     att_last_col: torch.Tensor
     swaps: list[tuple[int, int]]
     blocks: list[tuple[int, int]]
@@ -80,6 +83,7 @@ class ScoreOutputs:
 
 @dataclass
 class FrequencyScoreOutputs:
+    """Sorties de l’analyse fréquentielle RoPE par couche, tête et fréquence."""
     full_scores: torch.Tensor
     frequency_scores: torch.Tensor
     frequency_logit_norms: torch.Tensor
@@ -93,9 +97,8 @@ class FrequencyScoreOutputs:
 
 
 # -----------------------------------------------------------------------------
-# region 1) Model + prompt
+# 1) Model + prompt
 # -----------------------------------------------------------------------------
-
 
 def load_bundle(
     model_name: str = DEFAULT_MODEL,
@@ -104,6 +107,11 @@ def load_bundle(
     trust_remote_code: bool = True,
     attn_implementation: str = "eager",
 ) -> QwenBundle:
+    """Charge le tokenizer et le modèle, puis expose les méta-informations utiles.
+
+    Retourne un QwenBundle avec le device, le dtype et les dimensions
+    d’attention nécessaires aux analyses ultérieures.
+    """
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=trust_remote_code,
@@ -140,7 +148,16 @@ def load_bundle(
     )
 
 
-def encode_prompt(bundle: QwenBundle, prompt: str, add_generation_prompt: bool = True) -> PromptEncoding:
+def encode_prompt(
+    bundle: QwenBundle,
+    prompt: str,
+    add_generation_prompt: bool = True,
+) -> PromptEncoding:
+    """Applique le chat template puis tokenise le prompt.
+
+    Le résultat contient le texte exact envoyé au modèle, les tokens
+    associés et un bloc unique couvrant toute la séquence.
+    """
     messages = [{"role": "user", "content": prompt}]
     text = bundle.tokenizer.apply_chat_template(
         messages,
@@ -177,23 +194,24 @@ def encode_prompt(bundle: QwenBundle, prompt: str, add_generation_prompt: bool =
     )
 
 
-# endregion
-
-
 # -----------------------------------------------------------------------------
-# region 1bis) Prompt display helpers
+# 1bis) Prompt display helpers
 # -----------------------------------------------------------------------------
-
 
 def _normalize_token_ids(input_ids: torch.Tensor | list[int]) -> list[int]:
+    """Normalise des input_ids en liste Python 1D."""
     if isinstance(input_ids, torch.Tensor):
         if input_ids.ndim == 2:
             if input_ids.shape[0] != 1:
-                raise ValueError(f"input_ids doit avoir batch_size=1, reçu {tuple(input_ids.shape)}")
+                raise ValueError(
+                    f"input_ids doit avoir batch_size=1, reçu {tuple(input_ids.shape)}"
+                )
             return input_ids[0].detach().cpu().tolist()
         if input_ids.ndim == 1:
             return input_ids.detach().cpu().tolist()
-        raise ValueError(f"input_ids doit être de dimension 1 ou 2, reçu ndim={input_ids.ndim}")
+        raise ValueError(
+            f"input_ids doit être de dimension 1 ou 2, reçu ndim={input_ids.ndim}"
+        )
     return list(input_ids)
 
 
@@ -204,16 +222,7 @@ def print_prompt_with_blocks(
     prefix: str = "# ",
     show_tokens: bool = False,
 ) -> None:
-    """
-    Affiche le prompt réellement envoyé au modèle, découpé bloc par bloc.
-
-    Chaque bloc est imprimé sur une nouvelle ligne avec :
-      - son texte décodé via repr(...) pour rendre visibles les coupures,
-      - son index de bloc,
-      - son intervalle de positions tokenisées [start:end].
-
-    Si show_tokens=True, on affiche aussi les tokens bruts de chaque bloc.
-    """
+    """Affiche le prompt découpé par blocs avec leurs positions tokenisées."""
     ids = _normalize_token_ids(input_ids)
 
     print(f"{prefix}Prompt utilisé par le modèle, découpé en {len(blocks)} blocs :")
@@ -239,6 +248,7 @@ def print_encoding_blocks(
     show_tokens: bool = False,
     prefix: str = "# ",
 ) -> None:
+    """Wrapper pratique pour afficher les blocs d’un PromptEncoding."""
     print_prompt_with_blocks(
         tokenizer=bundle.tokenizer,
         input_ids=encoding.input_ids,
@@ -248,17 +258,15 @@ def print_encoding_blocks(
     )
 
 
-# endregion
-
-
 # -----------------------------------------------------------------------------
-# region 2) Permutations / swaps
+# 2) Permutations / swaps
 # -----------------------------------------------------------------------------
-
 
 def split_into_blocks(n_tokens: int, n_blocks: int) -> list[tuple[int, int]]:
+    """Découpe une séquence en blocs contigus de tailles quasi égales."""
     n_blocks = min(n_blocks, n_tokens)
     base, rem = divmod(n_tokens, n_blocks)
+
     out = []
     start = 0
     for b in range(n_blocks):
@@ -269,36 +277,47 @@ def split_into_blocks(n_tokens: int, n_blocks: int) -> list[tuple[int, int]]:
 
 
 def all_block_swaps(n_blocks: int) -> list[tuple[int, int]]:
+    """Liste toutes les paires de blocs distincts à permuter."""
     return [(i, j) for i in range(n_blocks - 1) for j in range(i + 1, n_blocks)]
 
 
-def build_swap_indices(seq_len: int, blocks: list[tuple[int, int]], swaps: list[tuple[int, int]]) -> torch.Tensor:
+def build_swap_indices(
+    seq_len: int,
+    blocks: list[tuple[int, int]],
+    swaps: list[tuple[int, int]],
+) -> torch.Tensor:
+    """Construit, pour chaque swap, la permutation de colonnes à appliquer.
+
+    Les blocs sont échangés sur leur préfixe commun si leurs tailles diffèrent.
+    """
     col_idx = torch.arange(seq_len).unsqueeze(0).expand(len(swaps), -1).clone()
+
     for k, (bi, bj) in enumerate(swaps):
         si, ei = blocks[bi]
         sj, ej = blocks[bj]
         li, lj = ei - si, ej - sj
+
         if min(li, lj) == 0:
             raise ValueError(f"Empty block in swap ({bi}, {bj}).")
+
         lmin = min(li, lj)
         col_idx[k, si:si + lmin] = torch.arange(sj, sj + lmin)
         col_idx[k, sj:sj + lmin] = torch.arange(si, si + lmin)
+
     return col_idx
 
 
 def permute_input_ids(input_ids: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
+    """Applique une permutation de positions à une séquence batchée."""
     return input_ids[:, perm]
 
 
-# endregion
-
-
 # -----------------------------------------------------------------------------
-# region 3) Attention extraction
+# 3) Attention extraction
 # -----------------------------------------------------------------------------
-
 
 def get_decoder_layers(bundle: QwenBundle):
+    """Retourne la liste des couches du décodeur."""
     return bundle.model.model.layers
 
 
@@ -309,8 +328,14 @@ def extract_last_token_attentions(
     seq_len: int,
     device: torch.device,
 ) -> torch.Tensor:
+    """Extrait l’attention du dernier token vers toute la séquence.
+
+    Retourne un tenseur de shape [num_layers, num_heads, seq_len].
+    """
     if attentions is None or len(attentions) == 0:
-        raise RuntimeError("No attentions returned; use attn_implementation='eager' and output_attentions=True.")
+        raise RuntimeError(
+            "No attentions returned; use attn_implementation='eager' and output_attentions=True."
+        )
 
     cols = []
     for a in attentions:
@@ -332,6 +357,7 @@ def run_model(
     output_hidden_states: bool = True,
     output_attentions: bool = True,
 ):
+    """Exécute le backbone du modèle en mode inférence, sans cache."""
     return bundle.model.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -348,6 +374,12 @@ def get_scores(
     blocks: list[tuple[int, int]],
     tau: float = 0.1,
 ) -> torch.Tensor:
+    """Calcule les scores positionnel et symbolique à partir des swaps.
+
+    La fonction agrège l’attention par bloc, compare la version originale
+    et les versions permutées, puis combine les similarités avec un poids
+    softmax contrôlé par tau.
+    """
     device = att_last_col.device
     nl, ns, _, nh, seq_len = att_last_col.shape
     n_swaps = len(swaps)
@@ -360,12 +392,14 @@ def get_scores(
     base = att_last_col[:, :, 0]
     perms = att_last_col[:, :, 1:]
 
+    # Mappe chaque position vers son bloc.
     token_to_block = torch.empty(seq_len, dtype=torch.long, device=device)
     block_sizes = torch.empty(m, dtype=torch.long, device=device)
     for b, (s, e) in enumerate(blocks):
         token_to_block[s:e] = b
         block_sizes[b] = e - s
 
+    # Moyenne d’attention par bloc sur la séquence d’origine.
     idx = token_to_block.view(1, 1, 1, -1).expand(nl, ns, nh, -1)
     block_sum_base = torch.zeros(nl, ns, nh, m, device=device, dtype=base.dtype)
     block_sum_base.scatter_add_(-1, idx, base)
@@ -373,13 +407,16 @@ def get_scores(
 
     perms = perms.permute(0, 1, 3, 2, 4)
 
+    # Identifiants de blocs après permutation.
     permuted_block_ids = token_to_block.unsqueeze(0).expand(n_swaps, -1).clone()
     bi = swaps_t[:, 0].unsqueeze(1)
     bj = swaps_t[:, 1].unsqueeze(1)
     permuted_block_ids = torch.where(permuted_block_ids == bi, bj, permuted_block_ids)
     permuted_block_ids = torch.where(permuted_block_ids == bj, bi, permuted_block_ids)
 
-    idx_perm = permuted_block_ids.view(1, 1, 1, n_swaps, seq_len).expand(nl, ns, nh, -1, -1)
+    idx_perm = permuted_block_ids.view(1, 1, 1, n_swaps, seq_len).expand(
+        nl, ns, nh, -1, -1
+    )
     block_sum_perm = torch.zeros(nl, ns, nh, n_swaps, m, device=device, dtype=perms.dtype)
     block_sum_perm.scatter_add_(-1, idx_perm, perms)
 
@@ -390,12 +427,17 @@ def get_scores(
     perm_sizes[:, bj1] = tmp
     block_avg_perm = block_sum_perm / perm_sizes.view(1, 1, 1, n_swaps, m)
 
+    # Compare les deux blocs concernés avant/après swap.
     vij_base = torch.stack([block_avg_base[..., bi1], block_avg_base[..., bj1]], dim=-1)
     swap_range = torch.arange(n_swaps, device=device)
-    vij_perm = torch.stack([block_avg_perm[..., swap_range, bj1], block_avg_perm[..., swap_range, bi1]], dim=-1)
+    vij_perm = torch.stack(
+        [block_avg_perm[..., swap_range, bj1], block_avg_perm[..., swap_range, bi1]],
+        dim=-1,
+    )
 
     deltas = (block_avg_base[..., bi1] - block_avg_base[..., bj1]).abs()
     weights = F.softmax(deltas / tau, dim=-1)
+
     pos = F.cosine_similarity(vij_perm, vij_base, dim=-1)
     sym = F.cosine_similarity(vij_perm, torch.flip(vij_base, dims=[-1]), dim=-1)
 
@@ -413,6 +455,12 @@ def collect_scores(
     verbose_prompt: bool = False,
     verbose_prompt_tokens: bool = False,
 ) -> ScoreOutputs:
+    """Calcule les scores globaux positionnel/symbolique pour un prompt.
+
+    La fonction encode le prompt, génère toutes les permutations de blocs,
+    extrait l’attention du dernier token, puis agrège les scores par couche
+    et par tête.
+    """
     encoding = encode_prompt(bundle, prompt)
     seq_len = encoding.input_ids.shape[1]
     blocks = split_into_blocks(seq_len, n_blocks)
@@ -429,12 +477,21 @@ def collect_scores(
     col_idx = build_swap_indices(seq_len, blocks, swaps).to(bundle.device)
 
     att_last_col = torch.empty(
-        bundle.num_layers, 1, len(swaps) + 1, bundle.num_heads, seq_len,
-        device=bundle.device, dtype=torch.float32
+        bundle.num_layers,
+        1,
+        len(swaps) + 1,
+        bundle.num_heads,
+        seq_len,
+        device=bundle.device,
+        dtype=torch.float32,
     )
 
     for swap_idx in range(len(swaps) + 1):
-        ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+        ids = (
+            encoding.input_ids
+            if swap_idx == 0
+            else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+        )
         mask = torch.ones_like(ids)
 
         out = run_model(
@@ -468,40 +525,56 @@ def collect_scores(
     )
 
 
-# endregion
-
-
 # -----------------------------------------------------------------------------
-# region 4) RoPE frequency analysis (optimized)
+# 4) RoPE frequency analysis
 # -----------------------------------------------------------------------------
-
 
 def rope_wavelengths(bundle: QwenBundle) -> torch.Tensor:
+    """Calcule la longueur d’onde associée à chaque fréquence RoPE."""
     idx = torch.arange(bundle.num_frequencies, dtype=torch.float32, device=bundle.device)
     inv_freq = 1.0 / (bundle.rope_theta ** (idx / bundle.num_frequencies))
     return (2.0 * math.pi) / inv_freq
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Applique la rotation RoPE sur les deux moitiés de la dernière dimension."""
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
-def apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def apply_rotary(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Applique l’embedding rotatif à q et k."""
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
 def repeat_kv_local(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Répète localement les têtes key/value pour aligner avec les query heads."""
     if n_rep == 1:
         return hidden_states
     bsz, nkv, seq_len, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(bsz, nkv, n_rep, seq_len, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        bsz, nkv, n_rep, seq_len, head_dim
+    )
     return hidden_states.reshape(bsz, nkv * n_rep, seq_len, head_dim)
 
 
-def compute_qk_for_layer(bundle: QwenBundle, hidden_in: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+def compute_qk_for_layer(
+    bundle: QwenBundle,
+    hidden_in: torch.Tensor,
+    layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reconstruit q et k rotatés pour une couche donnée.
+
+    Cette fonction reproduit la préparation des tenseurs d’attention
+    après layer norm, projections linéaires et application de RoPE.
+    """
     layer = get_decoder_layers(bundle)[layer_idx]
     attn = layer.self_attn
 
@@ -511,8 +584,12 @@ def compute_qk_for_layer(bundle: QwenBundle, hidden_in: torch.Tensor, layer_idx:
 
     x = layer.input_layernorm(hidden_in.to(device=device, dtype=dtype))
 
-    q = attn.q_proj(x).view(bsz, seq_len, bundle.num_heads, bundle.head_dim).transpose(1, 2).contiguous()
-    k = attn.k_proj(x).view(bsz, seq_len, bundle.num_kv_heads, bundle.head_dim).transpose(1, 2).contiguous()
+    q = attn.q_proj(x).view(
+        bsz, seq_len, bundle.num_heads, bundle.head_dim
+    ).transpose(1, 2).contiguous()
+    k = attn.k_proj(x).view(
+        bsz, seq_len, bundle.num_kv_heads, bundle.head_dim
+    ).transpose(1, 2).contiguous()
 
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
     cos, sin = bundle.model.model.rotary_emb(x, position_ids)
@@ -527,6 +604,7 @@ def compute_all_frequency_attentions_and_norms(
     k: torch.Tensor,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Décompose l’attention par fréquence RoPE et calcule les normes de logits."""
     half = q.shape[-1] // 2
 
     q_pairs = torch.stack([q[..., :half], q[..., half:]], dim=-1)
@@ -552,6 +630,11 @@ def collect_frequency_scores(
     store_full_frequency_tensor: bool = True,
     freq_chunk_size: int | None = None,
 ) -> FrequencyScoreOutputs:
+    """Calcule les scores globaux et fréquentiels pour un prompt donné.
+
+    Selon store_full_frequency_tensor, l’analyse fréquentielle est faite
+    en une passe complète ou par chunks pour réduire l’usage mémoire.
+    """
     encoding = encode_prompt(bundle, prompt)
     seq_len = encoding.input_ids.shape[1]
     blocks = split_into_blocks(seq_len, n_blocks)
@@ -578,7 +661,7 @@ def collect_frequency_scores(
     )
 
     freq_logit_norms = torch.empty(
-        nl, nh, nf,
+        nl, n_swaps + 1, nh, nf,
         device="cpu", dtype=torch.float32
     )
 
@@ -598,7 +681,11 @@ def collect_frequency_scores(
     )
 
     for swap_idx in range(n_swaps + 1):
-        ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+        ids = (
+            encoding.input_ids
+            if swap_idx == 0
+            else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+        )
         mask = torch.ones_like(ids)
 
         out = run_model(
@@ -617,13 +704,14 @@ def collect_frequency_scores(
 
         for layer_idx, hidden_in in enumerate(hidden_states):
             q, k = compute_qk_for_layer(bundle, hidden_in, layer_idx)
-            att_f, norms_f = compute_all_frequency_attentions_and_norms(q, k, bundle.head_dim)
+            att_f, norms_f = compute_all_frequency_attentions_and_norms(
+                q, k, bundle.head_dim
+            )
 
             if freq_att_last_col is not None:
                 freq_att_last_col[layer_idx, 0, swap_idx] = att_f[0].float()
 
-            if swap_idx == 0:
-                freq_logit_norms[layer_idx] = norms_f[0].float().cpu()
+            freq_logit_norms[layer_idx, swap_idx] = norms_f[0].float().cpu()
 
         del out, hidden_states
 
@@ -635,11 +723,11 @@ def collect_frequency_scores(
             nl, 1, n_swaps + 1, nf * nh, seq_len
         )
         scores_f = get_scores(freq_flat, swaps, blocks, tau=tau)
-        scores_f = scores_f.mean(dim=2).reshape(nl, nf, nh, 2).permute(0, 2, 1, 3).contiguous()
+        scores_f = scores_f.squeeze(dim=2).reshape(nl, nf, nh, 2).permute(0, 2, 1, 3).contiguous()
         frequency_scores.copy_(scores_f.detach().cpu())
         del freq_att_last_col, freq_flat, scores_f
-
     else:
+        # Variante mémoire-frugale : traitement par paquets de fréquences.
         for f0 in range(0, nf, freq_chunk_size):
             f1 = min(f0 + freq_chunk_size, nf)
             chunk = f1 - f0
@@ -650,7 +738,11 @@ def collect_frequency_scores(
             )
 
             for swap_idx in range(n_swaps + 1):
-                ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+                ids = (
+                    encoding.input_ids
+                    if swap_idx == 0
+                    else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+                )
                 mask = torch.ones_like(ids)
 
                 out = run_model(
@@ -666,11 +758,16 @@ def collect_frequency_scores(
                     q, k = compute_qk_for_layer(bundle, hidden_in, layer_idx)
 
                     half = q.shape[-1] // 2
-                    q_pairs = torch.stack([q[..., f0:f1], q[..., half + f0:half + f1]], dim=-1)
-                    k_pairs = torch.stack([k[..., f0:f1], k[..., half + f0:half + f1]], dim=-1)
+                    q_pairs = torch.stack(
+                        [q[..., f0:f1], q[..., half + f0:half + f1]], dim=-1
+                    )
+                    k_pairs = torch.stack(
+                        [k[..., f0:f1], k[..., half + f0:half + f1]], dim=-1
+                    )
 
                     q_last = q_pairs[:, :, -1]
-                    logits = torch.einsum("bhfd,bhtfd->bhft", q_last, k_pairs) / math.sqrt(bundle.head_dim)
+                    logits = torch.einsum("bhfd,bhtfd->bhft", q_last, k_pairs)
+                    logits = logits / math.sqrt(bundle.head_dim)
                     att = torch.softmax(logits, dim=-1)
 
                     freq_chunk_att[layer_idx, 0, swap_idx] = att[0].float()
@@ -700,37 +797,33 @@ def collect_frequency_scores(
     )
 
 
-# endregion
-
-
 # -----------------------------------------------------------------------------
-# region 5) Plots (matplotlib/seaborn version)
+# 5) Plots
 # -----------------------------------------------------------------------------
-
 
 def _as_numpy(x):
+    """Convertit un tenseur ou une séquence en tableau NumPy."""
     if torch is not None and isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
     return np.asarray(x)
 
 
 def _layer_head_labels(bundle: QwenBundle):
+    """Construit les labels standards de couches et de têtes."""
     layers = [f"L{l}" for l in range(bundle.num_layers)]
     heads = [f"H{h}" for h in range(bundle.num_heads)]
     return layers, heads
 
 
 def _score_title(prefix: str, n_tokens: int | None = None):
-    """
-    Titre de figure sans le prompt complet.
-    On montre juste le nombre de tokens si on le connaît.
-    """
+    """Construit un titre court, sans inclure le prompt complet."""
     if n_tokens is None:
         return prefix
     return f"{prefix} — {n_tokens} tokens"
 
 
 def _prepare_score_matrix(arr, expected_shape: tuple[int, int], name: str):
+    """Valide et normalise une matrice de scores [layers, heads]."""
     arr = _as_numpy(arr)
 
     if arr.ndim == 3 and arr.shape[-1] == 1:
@@ -749,7 +842,13 @@ def _prepare_score_matrix(arr, expected_shape: tuple[int, int], name: str):
     return np.asarray(arr, dtype=float)
 
 
-def _save_figure_with_meta(fig, save_path: str | None, caption: str, description: str):
+def _save_figure_with_meta(
+    fig,
+    save_path: str | None,
+    caption: str,
+    description: str,
+):
+    """Sauvegarde une figure et un petit fichier JSON de métadonnées."""
     if not save_path:
         return
 
@@ -775,6 +874,7 @@ def _maybe_print_scores_prompt(
     verbose_prompt: bool,
     verbose_prompt_tokens: bool,
 ):
+    """Affiche le prompt source si le mode verbeux est activé."""
     if not verbose_prompt:
         return
 
@@ -792,6 +892,7 @@ def _maybe_print_frequency_prompt(
     verbose_prompt: bool,
     verbose_prompt_tokens: bool,
 ):
+    """Affiche le prompt source de l’analyse fréquentielle si demandé."""
     if not verbose_prompt:
         return
 
@@ -811,12 +912,7 @@ def plot_pos_sym_heatmaps(
     verbose_prompt: bool = False,
     verbose_prompt_tokens: bool = False,
 ):
-    """
-    Heatmaps des scores positionnel et symbolique par couche et tête.
-
-    Le titre ne montre pas le prompt, juste un indicateur court (ex: nombre de tokens).
-    Le prompt réel est affiché via print() si verbose_prompt=True.
-    """
+    """Trace deux heatmaps: score positionnel et score symbolique."""
     _maybe_print_scores_prompt(
         bundle=bundle,
         scores=scores,
@@ -832,7 +928,6 @@ def plot_pos_sym_heatmaps(
 
     sns.set_theme(style="white")
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-
     cmap = mpl.colormaps["viridis"]
 
     sns.heatmap(
@@ -887,13 +982,7 @@ def plot_heads_scatter(
     verbose_prompt: bool = False,
     verbose_prompt_tokens: bool = False,
 ):
-    """
-    Nuage de points des heads dans le plan (score positionnel, score symbolique),
-    coloré par couche.
-
-    Le titre ne montre pas le prompt, juste un indicateur court (ex: nombre de tokens).
-    Le prompt réel est affiché via print() si verbose_prompt=True.
-    """
+    """Projette chaque head dans le plan (score positionnel, score symbolique)."""
     _maybe_print_scores_prompt(
         bundle=bundle,
         scores=scores,
@@ -937,7 +1026,10 @@ def plot_heads_scatter(
         fig,
         save_path,
         caption="Nuage de points des heads",
-        description="Position des heads dans le plan score positionnel-score symbolique, colorées par couche.",
+        description=(
+            "Position des heads dans le plan score positionnel-score symbolique, "
+            "colorées par couche."
+        ),
     )
     return fig
 
@@ -951,14 +1043,10 @@ def plot_frequency_analysis(
     verbose_prompt: bool = False,
     verbose_prompt_tokens: bool = False,
 ):
-    """
-    Analyse fréquentielle pour une tête donnée dans une seule figure :
-      - haut : scores positionnel et symbolique par index de fréquence
-      - bas  : normes par index de fréquence
+    """Visualise les scores et normes fréquentiels d’une tête donnée.
 
-    Le titre affiche les vrais scores globaux de la tête étudiée
-    (positionnel et symbolique), sans le prompt.
-    Le prompt réel est affiché via print() si verbose_prompt=True.
+    La figure contient les scores par fréquence en haut, puis les normes
+    de logits en bas, avec rappel des scores globaux dans le titre.
     """
     _maybe_print_frequency_prompt(
         bundle=bundle,
@@ -968,7 +1056,6 @@ def plot_frequency_analysis(
     )
 
     wavelengths = np.asarray(_as_numpy(freq.frequency_wavelengths), dtype=float)
-
     freq_scores = np.asarray(_as_numpy(freq.frequency_scores), dtype=float)
     norm_all = np.asarray(_as_numpy(freq.frequency_logit_norms), dtype=float)
     full_scores = np.asarray(_as_numpy(freq.full_scores), dtype=float)
@@ -988,10 +1075,10 @@ def plot_frequency_analysis(
             f"[num_layers, num_heads, num_freq, 2], reçu {freq_scores.shape}"
         )
 
-    if norm_all.ndim != 3 or norm_all.shape[:2] != (bundle.num_layers, bundle.num_heads):
+    if (norm_all.ndim != 4 or norm_all.shape[0] != bundle.num_layers or norm_all.shape[2] != bundle.num_heads):
         raise ValueError(
             "freq.frequency_logit_norms doit avoir la shape "
-            f"[num_layers, num_heads, num_freq], reçu {norm_all.shape}"
+            f"[num_layers, n_swaps + 1, num_heads, num_freq], reçu {norm_all.shape}"
         )
 
     if full_scores.ndim != 3 or full_scores.shape != (bundle.num_layers, bundle.num_heads, 2):
@@ -1000,15 +1087,15 @@ def plot_frequency_analysis(
             f"[num_layers, num_heads, 2], reçu {full_scores.shape}"
         )
 
-    if len(wavelengths) != freq_scores.shape[2] or len(wavelengths) != norm_all.shape[2]:
+    if len(wavelengths) != freq_scores.shape[2] or len(wavelengths) != norm_all.shape[3]:
         raise ValueError(
             "Incohérence entre le nombre de wavelengths et le nombre de fréquences "
-            f"({len(wavelengths)} vs {freq_scores.shape[2]} vs {norm_all.shape[2]})"
+            f"({len(wavelengths)} vs {freq_scores.shape[2]} vs {norm_all.shape[3]})"
         )
 
     head_freq_scores = freq_scores[layer_idx, head_idx]
-    norm_mean = norm_all.mean(axis=(0, 1))
-    norm_orig = norm_all[layer_idx, head_idx]
+    norm_mean = norm_all[layer_idx, :, head_idx].mean(axis=0)
+    norm_orig = norm_all[layer_idx, 0, head_idx]
 
     head_full_score = full_scores[layer_idx, head_idx]
     head_pos_score = float(head_full_score[0])
@@ -1083,13 +1170,8 @@ def plot_frequency_analysis(
         caption="Analyse fréquentielle d'une tête",
         description=(
             "Figure unique avec scores positionnel et symbolique par fréquence, "
-            "ainsi que les normes par index de fréquence. Le titre affiche les "
-            "vrais scores globaux positionnel et symbolique de la tête étudiée, "
-            "sans le prompt."
+            "ainsi que les normes par index de fréquence."
         ),
     )
 
     return fig, head_pos_score, head_sym_score
-
-
-# endregion
