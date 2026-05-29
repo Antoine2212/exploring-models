@@ -24,15 +24,11 @@ export PYTHONUNBUFFERED=1
 
 source /home/antoine_df/gemma_explore/.venv/bin/activate
 
-pip install "vllm>=0.4.12" --no-cache-dir
-
-# Vérifier que vllm est bien installé
-python -c "import vllm; print('vllm version:', vllm.__version__)"
 
 # Exécuter avec python direct (pas uv run)
-python -u scripts/ruler_eval_qwen.py \
+uv run python -u scripts/ruler_eval_qwen.py \
   --model Qwen/Qwen2.5-0.5B-Instruct \
-  --backend vllm \
+  --backend hf \
   --device cuda \
   --max-length 32768 \
   --limit 20 \
