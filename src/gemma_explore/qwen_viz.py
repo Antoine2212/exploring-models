@@ -7,6 +7,8 @@ from typing import Any, Mapping, Sequence
 import matplotlib as mpl
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
 import numpy as np
 import seaborn as sns
 import torch
@@ -66,7 +68,7 @@ def _resolve_layer(
 
 
 def _heatmap(
-    ax: plt.Axes,
+    ax: Axes,
     data: np.ndarray,
     *,
     title: str,
@@ -95,7 +97,7 @@ def _heatmap(
 
 
 def _highlight_cols(
-    ax: plt.Axes,
+    ax: Axes,
     start: int,
     end: int,
     nrows: int,
@@ -145,7 +147,7 @@ def plot_all_attention_heads(
     figsize_per_panel: float = 5.5,
     ncols: int = 2,
     vmax: float | None = None,
-) -> plt.Figure:
+) -> Figure:
     """Plot all Q-head attention heatmaps for one prompt/layer."""
     prompt = _resolve_prompt(cache, prompt_id)
     layer = prompt["layers"][layer_idx]
@@ -207,7 +209,7 @@ def plot_head_block_dynamics(
     figsize: tuple[float, float] | None = None,
     highlight_q_slice: bool = True,
     highlight_kv_slice: bool = True,
-) -> plt.Figure:
+) -> Figure:
     """Plot the detailed flat notebook view for one prompt/layer/head."""
     prompt, layer = _resolve_layer(cache, prompt_id=prompt_id, layer_idx=layer_idx)
 
@@ -290,7 +292,7 @@ def plot_pos_sym_heatmaps(
     num_layers: int,
     num_heads: int,
     title: str = "Scores by layer and head",
-) -> plt.Figure:
+) -> Figure:
     """Plot positional and symbolic score heatmaps."""
     pos = _score_matrix(scores["pos_scores"] if isinstance(scores, Mapping) else scores.pos_scores, (num_layers, num_heads), "pos_scores")
     sym = _score_matrix(scores["sym_scores"] if isinstance(scores, Mapping) else scores.sym_scores, (num_layers, num_heads), "sym_scores")
@@ -341,7 +343,7 @@ def plot_heads_scatter(
     num_layers: int,
     num_heads: int,
     title: str = "Heads in positional/symbolic score plane",
-) -> plt.Figure:
+) -> Figure:
     """Scatter plot of heads in the positional vs symbolic plane."""
     pos = _score_matrix(scores["pos_scores"] if isinstance(scores, Mapping) else scores.pos_scores, (num_layers, num_heads), "pos_scores").reshape(-1)
     sym = _score_matrix(scores["sym_scores"] if isinstance(scores, Mapping) else scores.sym_scores, (num_layers, num_heads), "sym_scores").reshape(-1)
@@ -381,7 +383,7 @@ def plot_frequency_analysis(
     head_idx: int,
     max_label_len: int = 18,
     max_tokens: int | None = 64,
-) -> plt.Figure:
+) -> Figure:
     """Plot frequency-resolved scores, norms, and original full attention."""
     data = freq_scores if isinstance(freq_scores, Mapping) else freq_scores.__dict__
     frequency_scores = _as_numpy(data["frequency_scores"]).astype(float)
@@ -405,7 +407,7 @@ def plot_frequency_analysis(
     global_pos = float(full_scores[layer_idx, head_idx, 0])
     global_sym = float(full_scores[layer_idx, head_idx, 1])
 
-    fig = plt.figure(figsize=(16, 10), constrained_layout=True)
+    fig = Figure(figsize=(16, 10), constrained_layout=True)
     gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.3])
 
     ax0 = fig.add_subplot(gs[0, 0])
