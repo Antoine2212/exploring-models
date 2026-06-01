@@ -76,6 +76,7 @@ class ScoreOutputs:
     prompt_token_ids: list[int]
     prompt_text: str
     prompt_blocks: list[PromptBlock]
+    fix_query: bool = True
 
 
 @dataclass
@@ -93,6 +94,7 @@ class FrequencyScoreOutputs:
     prompt_token_ids: list[int]
     prompt_text: str
     prompt_blocks: list[PromptBlock]
+    fix_query: bool = True
 
 
 @dataclass
@@ -678,6 +680,32 @@ def get_scores(
     return torch.stack([pos_scores, sym_scores], dim=-1)
 
 
+def _compute_layer_attn_weights_fixed_query(
+    bundle: QwenBundle,
+    hidden_orig: torch.Tensor,
+    hidden_perm: torch.Tensor,
+    layer_idx: int,
+) -> torch.Tensor:
+    """Compute attention weights keeping Q from the original hidden state.
+
+    Q is taken from hidden_orig so the original last token's query is preserved.
+    K is taken from hidden_perm so the keys reflect the permuted token positions.
+    This isolates whether the last token attends to a *position* (positional) or
+    to a specific *symbol* (symbolic) when that symbol is moved by a block swap.
+
+    hidden_orig: [batch, seq, hidden_size] — unperturbed input to the layer
+    hidden_perm: [batch, seq, hidden_size] — permuted input to the layer
+    Returns: [batch, heads, seq, seq]
+    """
+    qkv_orig = compute_qkv_for_layer(bundle, hidden_orig, layer_idx)
+    qkv_perm = compute_qkv_for_layer(bundle, hidden_perm, layer_idx)
+    q = qkv_orig.q_post_rope.transpose(1, 2).contiguous()
+    k = qkv_perm.k_repeated
+    mask_4d = _causal_attention_mask(q, None)
+    attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(bundle.head_dim)
+    return torch.softmax(attn_scores + mask_4d, dim=-1)
+
+
 @torch.inference_mode()
 def collect_scores(
     bundle: QwenBundle,
@@ -688,8 +716,18 @@ def collect_scores(
     verbose_prompt_tokens: bool = False,
     apply_chat_template: bool = True,
     add_generation_prompt: bool = True,
+    fix_query: bool = True,
 ) -> ScoreOutputs:
-    """Compute positional/symbolic scores directly from the model."""
+    """Compute positional/symbolic scores via block-swap perturbations.
+
+    When fix_query=True (default), the last token's query is held fixed at its
+    original value while only the keys are permuted. This correctly measures
+    whether the last token attends to a *position* or a *symbol* even when the
+    last token itself is displaced by a swap.
+
+    When fix_query=False, both Q and K come from the fully permuted model run
+    (legacy behaviour).
+    """
     encoding = encode_prompt(
         bundle,
         prompt,
@@ -703,28 +741,48 @@ def collect_scores(
 
     swaps = all_block_swaps(len(blocks))
     col_idx = build_swap_indices(seq_len, blocks, swaps).to(bundle.device)
+    nl = bundle.num_layers
+    nh = bundle.num_heads
+    n_swaps = len(swaps)
 
-    att_last_col = torch.empty(
-        bundle.num_layers,
-        1,
-        len(swaps) + 1,
-        bundle.num_heads,
-        seq_len,
-        device=bundle.device,
-        dtype=torch.float32,
-    )
+    att_last_col = torch.empty(nl, 1, n_swaps + 1, nh, seq_len, device=bundle.device, dtype=torch.float32)
 
-    for swap_idx in range(len(swaps) + 1):
-        ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
-        mask = torch.ones_like(ids)
-        out = run_model(bundle, ids, mask, output_hidden_states=False, output_attentions=True)
-        att_last_col[:, 0, swap_idx] = extract_last_token_attentions(
-            out.attentions,
-            bundle.num_layers,
-            bundle.num_heads,
-            seq_len,
-            bundle.device,
+    if fix_query:
+        base_out = run_model(
+            bundle,
+            encoding.input_ids,
+            torch.ones_like(encoding.input_ids),
+            output_hidden_states=True,
+            output_attentions=False,
         )
+        base_hidden = base_out.hidden_states[:-1]  # input to each decoder layer
+
+        for layer_idx in range(nl):
+            w = _compute_layer_attn_weights(bundle, base_hidden[layer_idx], layer_idx)
+            att_last_col[layer_idx, 0, 0] = w[0, :, -1, :].float()
+
+        for swap_idx, perm in enumerate(col_idx):
+            ids_perm = permute_input_ids(encoding.input_ids, perm)
+            perm_out = run_model(
+                bundle,
+                ids_perm,
+                torch.ones_like(ids_perm),
+                output_hidden_states=True,
+                output_attentions=False,
+            )
+            perm_hidden = perm_out.hidden_states[:-1]
+            for layer_idx in range(nl):
+                w = _compute_layer_attn_weights_fixed_query(
+                    bundle, base_hidden[layer_idx], perm_hidden[layer_idx], layer_idx
+                )
+                att_last_col[layer_idx, 0, swap_idx + 1] = w[0, :, -1, :].float()
+    else:
+        for swap_idx in range(n_swaps + 1):
+            ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
+            out = run_model(bundle, ids, torch.ones_like(ids), output_hidden_states=False, output_attentions=True)
+            att_last_col[:, 0, swap_idx] = extract_last_token_attentions(
+                out.attentions, nl, nh, seq_len, bundle.device
+            )
 
     scores = get_scores(att_last_col, swaps, blocks, tau=tau).detach().cpu()
     return ScoreOutputs(
@@ -738,6 +796,7 @@ def collect_scores(
         prompt_token_ids=encoding.input_ids[0].tolist(),
         prompt_text=encoding.text,
         prompt_blocks=encoding.blocks,
+        fix_query=fix_query,
     )
 
 
@@ -785,8 +844,17 @@ def collect_frequency_scores(
     verbose_prompt_tokens: bool = False,
     apply_chat_template: bool = True,
     add_generation_prompt: bool = True,
+    fix_query: bool = True,
 ) -> FrequencyScoreOutputs:
-    """Compute full and frequency-resolved scores directly from the model."""
+    """Compute full and frequency-resolved scores via block-swap perturbations.
+
+    When fix_query=True (default), the last token's query is held fixed at its
+    original value while only the keys are permuted, matching the behaviour of
+    collect_scores with fix_query=True.
+
+    When fix_query=False, both Q and K come from the fully permuted model run
+    (legacy behaviour).
+    """
     encoding = encode_prompt(
         bundle,
         prompt,
@@ -810,38 +878,75 @@ def collect_frequency_scores(
     freq_logit_norms = torch.empty(nl, n_swaps + 1, nh, nf, device="cpu", dtype=torch.float32)
     freq_att_last_col = torch.empty(nl, 1, n_swaps + 1, nh, nf, seq_len, device=bundle.device, dtype=torch.float32)
 
-    attention_matrix = None
+    # Always run the base pass with attentions to capture the full attention matrix
+    base_out = run_model(
+        bundle,
+        encoding.input_ids,
+        torch.ones_like(encoding.input_ids),
+        output_hidden_states=True,
+        output_attentions=True,
+    )
+    attention_matrix = extract_full_attention_matrices(
+        base_out.attentions, nl, nh, seq_len, bundle.device
+    ).detach().cpu()
+    base_hidden = base_out.hidden_states[:-1]
 
-    for swap_idx in range(n_swaps + 1):
-        ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
-        mask = torch.ones_like(ids)
-        out = run_model(bundle, ids, mask, output_hidden_states=True, output_attentions=True)
+    # Base slot (swap_idx=0): Q and K both from original hidden states
+    full_att_last_col[:, 0, 0] = extract_last_token_attentions(
+        base_out.attentions, nl, nh, seq_len, bundle.device
+    )
+    for layer_idx, hidden_in in enumerate(base_hidden):
+        qkv = compute_qkv_for_layer(bundle, hidden_in, layer_idx)
+        q = qkv.q_post_rope.transpose(1, 2).contiguous()
+        k = qkv.k_repeated
+        att_f, norms_f = compute_all_frequency_attentions_and_norms(q, k, bundle.head_dim)
+        freq_att_last_col[layer_idx, 0, 0] = att_f[0].float()
+        freq_logit_norms[layer_idx, 0] = norms_f[0].float().cpu()
 
-        full_att_last_col[:, 0, swap_idx] = extract_last_token_attentions(
-            out.attentions, nl, nh, seq_len, bundle.device
+    # Swap slots
+    for swap_idx, perm in enumerate(col_idx):
+        ids_perm = permute_input_ids(encoding.input_ids, perm)
+        perm_out = run_model(
+            bundle,
+            ids_perm,
+            torch.ones_like(ids_perm),
+            output_hidden_states=True,
+            output_attentions=not fix_query,
         )
+        perm_hidden = perm_out.hidden_states[:-1]
 
-        if swap_idx == 0:
-            attention_matrix = extract_full_attention_matrices(
-                out.attentions, nl, nh, seq_len, bundle.device
-            ).detach().cpu()
-
-        hidden_states = out.hidden_states[:-1]
-        for layer_idx, hidden_in in enumerate(hidden_states):
-            qkv = compute_qkv_for_layer(bundle, hidden_in, layer_idx)
-            q = qkv.q_post_rope.transpose(1, 2).contiguous()
-            k = qkv.k_repeated
-            att_f, norms_f = compute_all_frequency_attentions_and_norms(q, k, bundle.head_dim)
-            freq_att_last_col[layer_idx, 0, swap_idx] = att_f[0].float()
-            freq_logit_norms[layer_idx, swap_idx] = norms_f[0].float().cpu()
+        slot = swap_idx + 1
+        if fix_query:
+            for layer_idx in range(nl):
+                qkv_orig = compute_qkv_for_layer(bundle, base_hidden[layer_idx], layer_idx)
+                qkv_perm = compute_qkv_for_layer(bundle, perm_hidden[layer_idx], layer_idx)
+                q = qkv_orig.q_post_rope.transpose(1, 2).contiguous()
+                k = qkv_perm.k_repeated
+                # Full attention
+                mask_4d = _causal_attention_mask(q, None)
+                attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(bundle.head_dim)
+                attn_weights = torch.softmax(attn_scores + mask_4d, dim=-1)
+                full_att_last_col[layer_idx, 0, slot] = attn_weights[0, :, -1, :].float()
+                # Frequency-resolved
+                att_f, norms_f = compute_all_frequency_attentions_and_norms(q, k, bundle.head_dim)
+                freq_att_last_col[layer_idx, 0, slot] = att_f[0].float()
+                freq_logit_norms[layer_idx, slot] = norms_f[0].float().cpu()
+        else:
+            full_att_last_col[:, 0, slot] = extract_last_token_attentions(
+                perm_out.attentions, nl, nh, seq_len, bundle.device
+            )
+            for layer_idx, hidden_in in enumerate(perm_hidden):
+                qkv = compute_qkv_for_layer(bundle, hidden_in, layer_idx)
+                q = qkv.q_post_rope.transpose(1, 2).contiguous()
+                k = qkv.k_repeated
+                att_f, norms_f = compute_all_frequency_attentions_and_norms(q, k, bundle.head_dim)
+                freq_att_last_col[layer_idx, 0, slot] = att_f[0].float()
+                freq_logit_norms[layer_idx, slot] = norms_f[0].float().cpu()
 
     full_scores = get_scores(full_att_last_col, swaps, blocks, tau=tau).detach().cpu().squeeze(dim=-2)
     freq_flat = freq_att_last_col.permute(0, 1, 2, 4, 3, 5).reshape(nl, 1, n_swaps + 1, nf * nh, seq_len)
     scores_f = get_scores(freq_flat, swaps, blocks, tau=tau)
     scores_f = scores_f.squeeze(dim=2).reshape(nl, nf, nh, 2).permute(0, 2, 1, 3).contiguous()
-
-    if attention_matrix is None:
-        raise RuntimeError("Failed to extract full attention matrix for original prompt")
 
     return FrequencyScoreOutputs(
         full_scores=full_scores,
@@ -855,4 +960,5 @@ def collect_frequency_scores(
         prompt_token_ids=encoding.input_ids[0].tolist(),
         prompt_text=encoding.text,
         prompt_blocks=encoding.blocks,
+        fix_query=fix_query,
     )
