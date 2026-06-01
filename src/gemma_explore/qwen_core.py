@@ -76,6 +76,7 @@ class ScoreOutputs:
     prompt_token_ids: list[int]
     prompt_text: str
     prompt_blocks: list[PromptBlock]
+    fix_query: bool = True
 
 
 @dataclass
@@ -93,6 +94,7 @@ class FrequencyScoreOutputs:
     prompt_token_ids: list[int]
     prompt_text: str
     prompt_blocks: list[PromptBlock]
+    fix_query: bool = True
 
 
 @dataclass
@@ -692,6 +694,32 @@ def _compute_layer_attn_weights(
     return torch.softmax(attn_scores + mask_4d, dim=-1)
 
 
+def _compute_layer_attn_weights_fixed_query(
+    bundle: QwenBundle,
+    hidden_orig: torch.Tensor,
+    hidden_perm: torch.Tensor,
+    layer_idx: int,
+) -> torch.Tensor:
+    """Compute attention weights keeping Q from the original hidden state.
+
+    Q is taken from hidden_orig so the original last token's query is preserved.
+    K is taken from hidden_perm so the keys reflect the permuted token positions.
+    This isolates whether the last token attends to a *position* (positional) or
+    to a specific *symbol* (symbolic) when that symbol is moved by a block swap.
+
+    hidden_orig: [batch, seq, hidden_size] — unperturbed input to the layer
+    hidden_perm: [batch, seq, hidden_size] — permuted input to the layer
+    Returns: [batch, heads, seq, seq]
+    """
+    qkv_orig = compute_qkv_for_layer(bundle, hidden_orig, layer_idx)
+    qkv_perm = compute_qkv_for_layer(bundle, hidden_perm, layer_idx)
+    q = qkv_orig.q_post_rope.transpose(1, 2).contiguous()
+    k = qkv_perm.k_repeated
+    mask_4d = _causal_attention_mask(q, None)
+    attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(bundle.head_dim)
+    return torch.softmax(attn_scores + mask_4d, dim=-1)
+
+
 @torch.inference_mode()
 def collect_scores(
     bundle: QwenBundle,
@@ -702,11 +730,20 @@ def collect_scores(
     verbose_prompt_tokens: bool = False,
     apply_chat_template: bool = True,
     add_generation_prompt: bool = True,
+    fix_query: bool = True,
 ) -> ScoreOutputs:
     """Compute positional/symbolic scores with per-layer hidden-state permutation.
 
     For each layer, the block swap is applied to that layer's input hidden states
     rather than to the token IDs, isolating each layer's own positional behavior.
+
+    When fix_query=True (default), the last token's query is held fixed at its
+    original value while only the permuted hidden states supply the keys. This
+    correctly measures whether the last token attends to a *position* or a
+    *symbol* even when the last token itself is displaced by a swap.
+
+    When fix_query=False, both Q and K come from the permuted hidden state
+    (legacy behaviour).
     """
     encoding = encode_prompt(
         bundle,
@@ -739,10 +776,14 @@ def collect_scores(
     for swap_idx in range(n_swaps + 1):
         perm = col_idx[swap_idx - 1] if swap_idx > 0 else None
         for layer_idx in range(nl):
-            hidden = base_hidden[layer_idx]
-            if perm is not None:
-                hidden = hidden[:, perm, :]
-            w = _compute_layer_attn_weights(bundle, hidden, layer_idx)
+            hidden_orig = base_hidden[layer_idx]
+            if perm is not None and fix_query:
+                w = _compute_layer_attn_weights_fixed_query(
+                    bundle, hidden_orig, hidden_orig[:, perm, :], layer_idx
+                )
+            else:
+                hidden = hidden_orig[:, perm, :] if perm is not None else hidden_orig
+                w = _compute_layer_attn_weights(bundle, hidden, layer_idx)
             att_last_col[layer_idx, 0, swap_idx] = w[0, :, -1, :].float()
 
     scores = get_scores(att_last_col, swaps, blocks, tau=tau).detach().cpu()
@@ -757,6 +798,7 @@ def collect_scores(
         prompt_token_ids=encoding.input_ids[0].tolist(),
         prompt_text=encoding.text,
         prompt_blocks=encoding.blocks,
+        fix_query=fix_query,
     )
 
 
@@ -804,11 +846,18 @@ def collect_frequency_scores(
     verbose_prompt_tokens: bool = False,
     apply_chat_template: bool = True,
     add_generation_prompt: bool = True,
+    fix_query: bool = True,
 ) -> FrequencyScoreOutputs:
     """Compute full and frequency-resolved scores with per-layer hidden-state permutation.
 
     For each layer, block swaps are applied to that layer's input hidden states,
     isolating each layer's own positional/symbolic behavior.
+
+    When fix_query=True (default), the last token's query is held fixed at its
+    original value while only the permuted hidden states supply the keys.
+
+    When fix_query=False, both Q and K come from the permuted hidden state
+    (legacy behaviour).
     """
     encoding = encode_prompt(
         bundle,
@@ -849,12 +898,17 @@ def collect_frequency_scores(
     for swap_idx in range(n_swaps + 1):
         perm = col_idx[swap_idx - 1] if swap_idx > 0 else None
         for layer_idx in range(nl):
-            hidden = base_hidden[layer_idx]
-            if perm is not None:
-                hidden = hidden[:, perm, :]
-            qkv = compute_qkv_for_layer(bundle, hidden, layer_idx)
-            q = qkv.q_post_rope.transpose(1, 2).contiguous()
-            k = qkv.k_repeated
+            hidden_orig = base_hidden[layer_idx]
+            if perm is not None and fix_query:
+                qkv_orig = compute_qkv_for_layer(bundle, hidden_orig, layer_idx)
+                qkv_perm = compute_qkv_for_layer(bundle, hidden_orig[:, perm, :], layer_idx)
+                q = qkv_orig.q_post_rope.transpose(1, 2).contiguous()
+                k = qkv_perm.k_repeated
+            else:
+                hidden = hidden_orig[:, perm, :] if perm is not None else hidden_orig
+                qkv = compute_qkv_for_layer(bundle, hidden, layer_idx)
+                q = qkv.q_post_rope.transpose(1, 2).contiguous()
+                k = qkv.k_repeated
             # Full attention for pos/sym scoring
             mask_4d = _causal_attention_mask(q, None)
             attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(bundle.head_dim)
@@ -882,4 +936,5 @@ def collect_frequency_scores(
         prompt_token_ids=encoding.input_ids[0].tolist(),
         prompt_text=encoding.text,
         prompt_blocks=encoding.blocks,
+        fix_query=fix_query,
     )
