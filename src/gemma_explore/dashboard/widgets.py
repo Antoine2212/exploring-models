@@ -1,4 +1,3 @@
-"""Kept for backwards compatibility; new code uses app.py directly."""
 import panel as pn
 
 

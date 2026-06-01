@@ -24,47 +24,11 @@ def _coerce_prompt_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _make_prompt_preview(prompt_text: str, max_len: int = 72) -> str:
-    normalized = " ".join(prompt_text.split())
-    if len(normalized) <= max_len:
-        return normalized
-    return f"{normalized[: max_len - 1].rstrip()}…"
-
 
 def _extract_history_options(dashboard_state: state.DashboardState) -> list[HistoryOption]:
-    prompts = getattr(dashboard_state, "prompt_history", None)
-    if prompts is None:
-        prompts = getattr(dashboard_state, "history", None)
-
     options: list[HistoryOption] = []
-    seen_prompts: set[str] = set()
-    if not prompts:
-        return options
-
-    for item in prompts:
-        prompt_text = ""
-        if isinstance(item, str):
-            prompt_text = item
-        else:
-            for attr_name in ("prompt", "prompt_text", "text", "raw_prompt"):
-                candidate = getattr(item, attr_name, None)
-                if candidate:
-                    prompt_text = str(candidate)
-                    break
-            if not prompt_text and isinstance(item, dict):
-                for key in ("prompt", "prompt_text", "text", "raw_prompt"):
-                    candidate = item.get(key)
-                    if candidate:
-                        prompt_text = str(candidate)
-                        break
-
-        prompt_text = _coerce_prompt_text(prompt_text)
-        if not prompt_text or prompt_text in seen_prompts:
-            continue
-
-        seen_prompts.add(prompt_text)
-        options.append((_make_prompt_preview(prompt_text), prompt_text))
-
+    for entry in dashboard_state.registry.entries:
+        options.append((entry.display_label, entry.prompt_text))
     return options
 
 
