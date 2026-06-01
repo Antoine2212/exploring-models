@@ -1,298 +1,260 @@
-"""Main dashboard application."""
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-from typing import Optional
+from typing import Any, Callable
 
 import panel as pn
+from param.parameterized import Event
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
-
-from gemma_explore.dashboard.head_matrix import HeadMatrix
-from gemma_explore.dashboard.prompt_registry import PromptRegistry
-from gemma_explore.dashboard.state import DashboardState, load_entry, run_prompt
-from gemma_explore.dashboard.views.freq_view import FreqView
-from gemma_explore.dashboard.views.hidden_view import HiddenView
-from gemma_explore.dashboard.views.layer_view import LayerView
-from gemma_explore.dashboard.views.model_view import ModelView
+from gemma_explore.dashboard import state, widgets
+from gemma_explore.dashboard.views.freq_view import FrequencyView
+from gemma_explore.dashboard.views.head_view import HeadView
+from gemma_explore.dashboard.views.score_view import ScoreView
 from gemma_explore.qwen_core import QwenBundle, load_bundle
 
 
-# ------------------------------------------------------------------
-# Prompt manager sidebar section
-# ------------------------------------------------------------------
+HistoryOption = tuple[str, str]
 
 
-class PromptManager:
-    """
-    Sidebar widget set for prompt management.
+def _coerce_prompt_text(value: Any) -> str:
+    """Normalize a prompt-like value to displayable text."""
+    if value is None:
+        return ""
+    return str(value).strip()
 
-    Modes:
-      - "select" : pick from history dropdown  → Load button
-      - "new"    : text area + chat-template toggle → Run button
-    """
 
-    def __init__(self, state: DashboardState, on_load: callable, on_new: callable) -> None:
-        self._state = state
-        self._on_load = on_load
-        self._on_new = on_new
+def _make_prompt_preview(prompt_text: str, max_len: int = 72) -> str:
+    """Create a readable one-line preview label for a prompt."""
+    normalized = " ".join(prompt_text.split())
+    if len(normalized) <= max_len:
+        return normalized
+    return f"{normalized[: max_len - 1].rstrip()}…"
 
-        # ---- History selector ----
-        self._history_select = pn.widgets.Select(
-            name="History",
-            options=self._build_options(),
+
+def _extract_history_options(dashboard_state: state.DashboardState) -> list[HistoryOption]:
+    """Build prompt history options from dashboard state while preserving order."""
+    prompts = getattr(dashboard_state, "prompt_history", None)
+    if prompts is None:
+        prompts = getattr(dashboard_state, "history", None)
+
+    options: list[HistoryOption] = []
+    seen_prompts: set[str] = set()
+    if not prompts:
+        return options
+
+    for item in prompts:
+        prompt_text = ""
+        if isinstance(item, str):
+            prompt_text = item
+        else:
+            for attr_name in ("prompt", "prompt_text", "text", "raw_prompt"):
+                candidate = getattr(item, attr_name, None)
+                if candidate:
+                    prompt_text = str(candidate)
+                    break
+            if not prompt_text and isinstance(item, dict):
+                for key in ("prompt", "prompt_text", "text", "raw_prompt"):
+                    candidate = item.get(key)
+                    if candidate:
+                        prompt_text = str(candidate)
+                        break
+
+        prompt_text = _coerce_prompt_text(prompt_text)
+        if not prompt_text or prompt_text in seen_prompts:
+            continue
+
+        seen_prompts.add(prompt_text)
+        options.append((_make_prompt_preview(prompt_text), prompt_text))
+
+    return options
+
+
+class PromptHistoryController:
+    """Synchronize the prompt history widget with dashboard state."""
+
+    def __init__(
+        self,
+        dashboard_state: state.DashboardState,
+        prompt_input: pn.widgets.TextAreaInput,
+        status_pane: pn.pane.Markdown,
+        refresh_views: Callable[[], None],
+    ) -> None:
+        self._dashboard_state = dashboard_state
+        self._prompt_input = prompt_input
+        self._status_pane = status_pane
+        self._refresh_views = refresh_views
+        self._is_syncing = False
+
+        self.widget = pn.widgets.Select(
+            name="Prompt history",
+            options={},
+            value=None,
             sizing_mode="stretch_width",
         )
-        self._load_btn = pn.widgets.Button(
-            name="Load", button_type="primary", sizing_mode="stretch_width"
-        )
-        self._delete_btn = pn.widgets.Button(
-            name="Delete from registry", button_type="danger", sizing_mode="stretch_width"
-        )
+        self.widget.param.watch(self._on_history_selected, "value")
+        self.sync_from_state(preserve_selection=False)
 
-        # ---- New prompt ----
-        self._prompt_input = pn.widgets.TextAreaInput(
-            name="New prompt",
-            placeholder="Enter a prompt…",
-            rows=4,
-            sizing_mode="stretch_width",
-        )
-        self._chat_toggle = pn.widgets.Checkbox(
-            name="Apply chat template",
-            value=True,
-        )
-        self._run_btn = pn.widgets.Button(
-            name="Run", button_type="success", sizing_mode="stretch_width"
-        )
+    def sync_from_state(self, preserve_selection: bool = True) -> None:
+        """Refresh widget options from state while avoiding recursive callbacks."""
+        current_value = self.widget.value if preserve_selection else None
+        active_prompt = _coerce_prompt_text(getattr(self._dashboard_state, "prompt", ""))
+        options_list = _extract_history_options(self._dashboard_state)
+        options = {label: prompt for label, prompt in options_list}
 
-        # ---- Status ----
-        self._status = pn.pane.Markdown(
-            "", sizing_mode="stretch_width", margin=(4, 0, 0, 0)
-        )
+        next_value = None
+        if current_value in options.values():
+            next_value = current_value
+        elif active_prompt and active_prompt in options.values():
+            next_value = active_prompt
 
-        # ---- Accordion layout ----
-        history_col = pn.Column(
-            self._history_select,
-            pn.Row(self._load_btn, self._delete_btn, sizing_mode="stretch_width"),
-            sizing_mode="stretch_width",
-        )
-        new_col = pn.Column(
-            self._prompt_input,
-            self._chat_toggle,
-            self._run_btn,
-            sizing_mode="stretch_width",
-        )
-        self._accordion = pn.Accordion(
-            ("History", history_col),
-            ("New prompt", new_col),
-            active=[0] if self._state.registry.entries else [1],
-            sizing_mode="stretch_width",
-        )
-
-        # ---- Wire up ----
-        self._load_btn.on_click(self._do_load)
-        self._delete_btn.on_click(self._do_delete)
-        self._run_btn.on_click(self._do_run)
-
-        self.panel = pn.Column(
-            self._accordion,
-            self._status,
-            sizing_mode="stretch_width",
-        )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _build_options(self) -> list[str]:
-        labels = self._state.registry.labels()
-        return labels if labels else ["(no prompts yet)"]
-
-    def _set_status(self, msg: str) -> None:
-        self._status.object = msg
-
-    def _sync_history(self) -> None:
-        labels = self._build_options()
-        self._history_select.options = labels
-        active_label = next(
-            (e.display_label for e in self._state.registry.entries
-             if e.prompt_hash == self._state.active_prompt_hash),
-            None,
-        )
-        if active_label and active_label in labels:
-            self._history_select.value = active_label
-
-    # ------------------------------------------------------------------
-    # Event handlers
-    # ------------------------------------------------------------------
-
-    def _do_load(self, _event) -> None:
-        label = self._history_select.value
-        if not label or label == "(no prompts yet)":
-            self._set_status("No prompt selected.")
-            return
-        entry = self._state.registry.get_by_label(label)
-        if entry is None:
-            self._set_status(f"Entry not found: {label!r}")
-            return
-        self._load_btn.disabled = True
-        self._set_status("Loading…")
+        self._is_syncing = True
         try:
-            self._on_load(entry)
-            self._set_status("Loaded from cache.")
-        except Exception as exc:
-            self._set_status(f"Load failed: {exc}")
+            self.widget.options = options
+            self.widget.value = next_value
         finally:
-            self._load_btn.disabled = False
+            self._is_syncing = False
 
-    def _do_delete(self, _event) -> None:
-        label = self._history_select.value
-        if not label or label == "(no prompts yet)":
+    def set_active_prompt(self, prompt_text: str) -> None:
+        """Select the active prompt in the widget if present."""
+        normalized_prompt = _coerce_prompt_text(prompt_text)
+        if normalized_prompt not in set(self.widget.options.values()):
+            self.sync_from_state(preserve_selection=True)
             return
-        entry = self._state.registry.get_by_label(label)
-        if entry is None:
-            return
-        self._state.registry.remove(entry.prompt_hash)
-        self._sync_history()
-        self._set_status(f"Deleted from registry: {label[:40]}")
 
-    def _do_run(self, _event) -> None:
-        text = self._prompt_input.value.strip()
-        if not text:
-            self._set_status("Prompt is empty.")
-            return
-        self._run_btn.disabled = True
-        self._run_btn.name = "Running…"
-        self._set_status("Running model…")
+        self._is_syncing = True
         try:
-            self._on_new(text, self._chat_toggle.value)
-            self._sync_history()
-            self._set_status("Done.")
-        except Exception as exc:
-            self._set_status(f"Run failed: {exc}")
+            self.widget.value = normalized_prompt
         finally:
-            self._run_btn.name = "Run"
-            self._run_btn.disabled = False
+            self._is_syncing = False
 
+    def _on_history_selected(self, event: Event) -> None:
+        """Restore a previous prompt from cache without recomputation."""
+        if self._is_syncing:
+            return
 
-# ------------------------------------------------------------------
-# App builder
-# ------------------------------------------------------------------
+        prompt_text = _coerce_prompt_text(event.new)
+        if not prompt_text:
+            return
+
+        current_prompt = _coerce_prompt_text(getattr(self._dashboard_state, "prompt", ""))
+        if prompt_text == current_prompt:
+            self._prompt_input.value = prompt_text
+            return
+
+        try:
+            restore_prompt = getattr(self._dashboard_state, "restore_prompt", None)
+            if callable(restore_prompt):
+                restore_prompt(prompt_text)
+            else:
+                state.restore_prompt(self._dashboard_state, prompt_text)
+            self._prompt_input.value = prompt_text
+            self._status_pane.object = "Prompt restored from session history."
+            self._refresh_views()
+        except Exception as exc:  # pragma: no cover - UI surface
+            self._status_pane.object = f"Prompt restore failed: `{exc}`"
+            self.sync_from_state(preserve_selection=False)
 
 
 def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
-    registry = PromptRegistry()
-    state = DashboardState(bundle=bundle, registry=registry)
+    """Build the dashboard with persistent widgets and views."""
+    dashboard_state = state.DashboardState(bundle=bundle)
 
-    # ---- Views ----
-    model_view = ModelView(state)
-    layer_view = LayerView(state)
-    freq_view = FreqView(state)
-    hidden_view = HiddenView(state)
-
-    # ---- Head matrix ----
-    def _on_head_select(layer: int, head: int) -> None:
-        state.selected_layer = layer
-        state.selected_head = head
-        layer_view.refresh()
-        freq_view.refresh()
-        hidden_view.refresh()  # no-op if not active
-        _selected_label.object = f"**Selected:** layer {layer} · head {head}"
-
-    head_matrix = HeadMatrix(
-        num_layers=bundle.num_layers,
-        num_heads=bundle.num_heads,
-        on_select=_on_head_select,
-    )
-
-    _selected_label = pn.pane.Markdown(
-        "**Selected:** layer 0 · head 0",
+    layer_slider = widgets.make_layer_slider(bundle.num_layers)
+    head_slider = widgets.make_head_slider(bundle.num_heads)
+    prompt_input = widgets.make_prompt_input()
+    run_button = widgets.make_run_button()
+    status_pane = pn.pane.Markdown(
+        "Enter a prompt and click **Run**.",
         sizing_mode="stretch_width",
-        margin=(4, 0, 0, 0),
+        margin=(0, 0, 8, 0),
     )
 
-    # ---- Tabs ----
+    head_view = HeadView(dashboard_state, layer_slider, head_slider)
+    score_view = ScoreView(dashboard_state)
+    freq_view = FrequencyView(dashboard_state, layer_slider, head_slider)
+
     tabs = pn.Tabs(
-        ("Model", model_view.panel),
-        ("Layer", layer_view.panel),
+        ("Head detail", head_view.panel),
+        ("Scores", score_view.panel),
         ("Frequency", freq_view.panel),
-        ("Hidden states", hidden_view.panel),
-        dynamic=False,
+        dynamic=True,
         sizing_mode="stretch_both",
         tabs_location="above",
     )
 
-    def _on_tab_change(event) -> None:
-        idx = event.new
-        if idx == 3:
-            hidden_view.activate()
-        else:
-            hidden_view.deactivate()
-
-    tabs.param.watch(_on_tab_change, "active")
-
-    # ---- Prompt management ----
-    def _do_load(entry) -> None:
-        load_entry(state, entry)
-        _after_prompt_change()
-
-    def _do_new(text: str, apply_chat_template: bool) -> None:
-        run_prompt(state, text, apply_chat_template=apply_chat_template)
-        _after_prompt_change()
-
-    def _after_prompt_change() -> None:
-        # Update head matrix scores
-        if state.scores is not None:
-            import torch
-            pos = state.scores.get("pos_scores")
-            sym = state.scores.get("sym_scores")
-            if pos is not None and sym is not None:
-                import numpy as np
-                p = np.array(pos).reshape(bundle.num_layers, bundle.num_heads)
-                s_arr = np.array(sym).reshape(bundle.num_layers, bundle.num_heads)
-                head_matrix.update_scores(p.flatten().tolist(), s_arr.flatten().tolist())
-        # Refresh all views
-        model_view.refresh()
-        layer_view.refresh()
+    def _refresh_all_views() -> None:
+        """Refresh all persistent view panes."""
+        head_view.refresh()
+        score_view.refresh()
         freq_view.refresh()
-        if hidden_view._active:
-            hidden_view.refresh()
 
-    prompt_manager = PromptManager(state, on_load=_do_load, on_new=_do_new)
+    history_controller = PromptHistoryController(
+        dashboard_state=dashboard_state,
+        prompt_input=prompt_input,
+        status_pane=status_pane,
+        refresh_views=_refresh_all_views,
+    )
 
-    # ---- Sidebar ----
+    def _set_controls_enabled(enabled: bool) -> None:
+        """Enable or disable interactive controls."""
+        prompt_input.disabled = not enabled
+        run_button.disabled = not enabled
+        layer_slider.disabled = not enabled
+        head_slider.disabled = not enabled
+        history_controller.widget.disabled = not enabled
+
+    def _on_slider_change(_: object) -> None:
+        """Refresh only slider-dependent views."""
+        head_view.refresh()
+        freq_view.refresh()
+
+    def _on_run(_: object) -> None:
+        """Run the prompt and update existing views in place."""
+        prompt_text = prompt_input.value.strip()
+        if not prompt_text:
+            status_pane.object = "Please enter a prompt."
+            return
+
+        _set_controls_enabled(False)
+        run_button.name = "Running..."
+        status_pane.object = "Running prompt and updating plots..."
+
+        try:
+            changed = state.run_prompt(dashboard_state, prompt_text)
+            history_controller.sync_from_state(preserve_selection=True)
+            history_controller.set_active_prompt(prompt_text)
+            if changed:
+                status_pane.object = "Prompt completed."
+            else:
+                status_pane.object = "Prompt unchanged; reused cached results."
+            _refresh_all_views()
+        except Exception as exc:  # pragma: no cover - UI surface
+            status_pane.object = f"Run failed: `{exc}`"
+        finally:
+            run_button.name = "Run"
+            _set_controls_enabled(True)
+
+    layer_slider.param.watch(_on_slider_change, "value")
+    head_slider.param.watch(_on_slider_change, "value")
+    run_button.on_click(_on_run)
+
     sidebar = pn.Column(
-        pn.pane.Markdown("## Qwen Explore", margin=(0, 0, 8, 0)),
-        prompt_manager.panel,
-        pn.layout.Divider(),
-        head_matrix.panel,
-        _selected_label,
-        width=340,
+        prompt_input,
+        run_button,
+        pn.Spacer(height=8),
+        history_controller.widget,
+        pn.Spacer(height=8),
+        layer_slider,
+        head_slider,
+        pn.Spacer(height=8),
+        status_pane,
+        width=320,
         min_width=300,
-        max_width=380,
+        max_width=360,
         sizing_mode="fixed",
     )
 
-    # Load first registry entry automatically if available
-    def _autoload() -> None:
-        entries = state.registry.entries
-        if entries:
-            try:
-                load_entry(state, entries[-1])
-                _after_prompt_change()
-                prompt_manager._sync_history()
-                prompt_manager._set_status(f"Auto-loaded: {entries[-1].display_label[:40]}")
-            except Exception:
-                pass
-
-    pn.state.onload(_autoload)
-
     template = pn.template.FastListTemplate(
-        title="Qwen Explore",
+        title="Gemma Explore Dashboard",
         sidebar=[sidebar],
         main=[
             pn.Column(
@@ -307,17 +269,12 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
     return template
 
 
-def launch_dashboard(
-    bundle: Optional[QwenBundle] = None,
-    port: int = 5006,
-    show: bool = True,
-) -> None:
-    pn.extension("bokeh", "matplotlib")
-    if bundle is None:
-        bundle = load_bundle()
-    app = build_app(bundle)
-    pn.serve(app.servable(), port=port, show=show)
+def launch_dashboard(bundle: QwenBundle, port: int = 5006, show: bool = True) -> None:
+    """Serve the dashboard."""
+    pn.extension("matplotlib")
+    app = build_app(bundle).servable()
+    pn.serve(app, port=port, show=show)
 
 
 if __name__ == "__main__":
-    launch_dashboard()
+    launch_dashboard(load_bundle())

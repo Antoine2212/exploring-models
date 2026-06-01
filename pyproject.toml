@@ -26,10 +26,14 @@ dependencies = [
     "tqdm>=4.67.3",
     "transformers>=5.9.0",
     "wonderwords>=3.0.1",
+    "panel>=1.4.0",
+    "bokeh>=3.4.0",
+    "param>=2.0.0",
 ]
 
 [project.scripts]
 gemma-explore = "gemma_explore:main"
+gemma-dashboard = "gemma_explore.dashboard._launcher:main"
 
 [build-system]
 requires = ["uv_build>=0.11.6,<0.12.0"]
