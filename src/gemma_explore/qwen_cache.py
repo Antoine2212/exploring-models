@@ -27,7 +27,7 @@ from gemma_explore.qwen_core import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -119,9 +119,15 @@ def upgrade_cache_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if "schema_version" in upgraded and "derived" in upgraded:
         upgraded.setdefault("meta", {})
         upgraded.setdefault("prompts", [])
-        upgraded["schema_version"] = int(upgraded["schema_version"])
+        stored_version = int(upgraded["schema_version"])
+        upgraded["schema_version"] = SCHEMA_VERSION
         upgraded["derived"].setdefault("scores", {})
         upgraded["derived"].setdefault("frequency_scores", {})
+        if stored_version < 3:
+            # Scores computed before v3 used input-level permutation; discard them
+            # so they are recomputed with the new hidden-state permutation method.
+            upgraded["derived"]["scores"] = {}
+            upgraded["derived"]["frequency_scores"] = {}
         for i, rec in enumerate(upgraded["prompts"]):
             rec.setdefault("prompt_id", i)
             if "attentions" in rec and "attentions_hf" not in rec:

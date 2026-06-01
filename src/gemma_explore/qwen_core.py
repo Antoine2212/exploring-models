@@ -678,6 +678,20 @@ def get_scores(
     return torch.stack([pos_scores, sym_scores], dim=-1)
 
 
+def _compute_layer_attn_weights(
+    bundle: QwenBundle,
+    hidden_in: torch.Tensor,
+    layer_idx: int,
+) -> torch.Tensor:
+    """Compute attention weights [batch, heads, seq, seq] without running MLP or residual."""
+    qkv = compute_qkv_for_layer(bundle, hidden_in, layer_idx)
+    q = qkv.q_post_rope.transpose(1, 2).contiguous()
+    k = qkv.k_repeated
+    mask_4d = _causal_attention_mask(q, None)
+    attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(bundle.head_dim)
+    return torch.softmax(attn_scores + mask_4d, dim=-1)
+
+
 @torch.inference_mode()
 def collect_scores(
     bundle: QwenBundle,
@@ -689,7 +703,11 @@ def collect_scores(
     apply_chat_template: bool = True,
     add_generation_prompt: bool = True,
 ) -> ScoreOutputs:
-    """Compute positional/symbolic scores directly from the model."""
+    """Compute positional/symbolic scores with per-layer hidden-state permutation.
+
+    For each layer, the block swap is applied to that layer's input hidden states
+    rather than to the token IDs, isolating each layer's own positional behavior.
+    """
     encoding = encode_prompt(
         bundle,
         prompt,
@@ -703,28 +721,29 @@ def collect_scores(
 
     swaps = all_block_swaps(len(blocks))
     col_idx = build_swap_indices(seq_len, blocks, swaps).to(bundle.device)
+    n_swaps = len(swaps)
+    nl = bundle.num_layers
+    nh = bundle.num_heads
 
-    att_last_col = torch.empty(
-        bundle.num_layers,
-        1,
-        len(swaps) + 1,
-        bundle.num_heads,
-        seq_len,
-        device=bundle.device,
-        dtype=torch.float32,
+    base_out = run_model(
+        bundle,
+        encoding.input_ids,
+        torch.ones_like(encoding.input_ids),
+        output_hidden_states=True,
+        output_attentions=False,
     )
+    base_hidden = base_out.hidden_states[:-1]  # input to each decoder layer
 
-    for swap_idx in range(len(swaps) + 1):
-        ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
-        mask = torch.ones_like(ids)
-        out = run_model(bundle, ids, mask, output_hidden_states=False, output_attentions=True)
-        att_last_col[:, 0, swap_idx] = extract_last_token_attentions(
-            out.attentions,
-            bundle.num_layers,
-            bundle.num_heads,
-            seq_len,
-            bundle.device,
-        )
+    att_last_col = torch.empty(nl, 1, n_swaps + 1, nh, seq_len, device=bundle.device, dtype=torch.float32)
+
+    for swap_idx in range(n_swaps + 1):
+        perm = col_idx[swap_idx - 1] if swap_idx > 0 else None
+        for layer_idx in range(nl):
+            hidden = base_hidden[layer_idx]
+            if perm is not None:
+                hidden = hidden[:, perm, :]
+            w = _compute_layer_attn_weights(bundle, hidden, layer_idx)
+            att_last_col[layer_idx, 0, swap_idx] = w[0, :, -1, :].float()
 
     scores = get_scores(att_last_col, swaps, blocks, tau=tau).detach().cpu()
     return ScoreOutputs(
@@ -786,7 +805,11 @@ def collect_frequency_scores(
     apply_chat_template: bool = True,
     add_generation_prompt: bool = True,
 ) -> FrequencyScoreOutputs:
-    """Compute full and frequency-resolved scores directly from the model."""
+    """Compute full and frequency-resolved scores with per-layer hidden-state permutation.
+
+    For each layer, block swaps are applied to that layer's input hidden states,
+    isolating each layer's own positional/symbolic behavior.
+    """
     encoding = encode_prompt(
         bundle,
         prompt,
@@ -806,31 +829,38 @@ def collect_frequency_scores(
     nh = bundle.num_heads
     nf = bundle.num_frequencies
 
+    # Base pass: capture hidden states and full attention matrix for visualization
+    base_out = run_model(
+        bundle,
+        encoding.input_ids,
+        torch.ones_like(encoding.input_ids),
+        output_hidden_states=True,
+        output_attentions=True,
+    )
+    base_hidden = base_out.hidden_states[:-1]  # input to each decoder layer
+    attention_matrix = extract_full_attention_matrices(
+        base_out.attentions, nl, nh, seq_len, bundle.device
+    ).detach().cpu()
+
     full_att_last_col = torch.empty(nl, 1, n_swaps + 1, nh, seq_len, device=bundle.device, dtype=torch.float32)
     freq_logit_norms = torch.empty(nl, n_swaps + 1, nh, nf, device="cpu", dtype=torch.float32)
     freq_att_last_col = torch.empty(nl, 1, n_swaps + 1, nh, nf, seq_len, device=bundle.device, dtype=torch.float32)
 
-    attention_matrix = None
-
     for swap_idx in range(n_swaps + 1):
-        ids = encoding.input_ids if swap_idx == 0 else permute_input_ids(encoding.input_ids, col_idx[swap_idx - 1])
-        mask = torch.ones_like(ids)
-        out = run_model(bundle, ids, mask, output_hidden_states=True, output_attentions=True)
-
-        full_att_last_col[:, 0, swap_idx] = extract_last_token_attentions(
-            out.attentions, nl, nh, seq_len, bundle.device
-        )
-
-        if swap_idx == 0:
-            attention_matrix = extract_full_attention_matrices(
-                out.attentions, nl, nh, seq_len, bundle.device
-            ).detach().cpu()
-
-        hidden_states = out.hidden_states[:-1]
-        for layer_idx, hidden_in in enumerate(hidden_states):
-            qkv = compute_qkv_for_layer(bundle, hidden_in, layer_idx)
+        perm = col_idx[swap_idx - 1] if swap_idx > 0 else None
+        for layer_idx in range(nl):
+            hidden = base_hidden[layer_idx]
+            if perm is not None:
+                hidden = hidden[:, perm, :]
+            qkv = compute_qkv_for_layer(bundle, hidden, layer_idx)
             q = qkv.q_post_rope.transpose(1, 2).contiguous()
             k = qkv.k_repeated
+            # Full attention for pos/sym scoring
+            mask_4d = _causal_attention_mask(q, None)
+            attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(bundle.head_dim)
+            attn_weights = torch.softmax(attn_scores + mask_4d, dim=-1)
+            full_att_last_col[layer_idx, 0, swap_idx] = attn_weights[0, :, -1, :].float()
+            # Frequency-resolved
             att_f, norms_f = compute_all_frequency_attentions_and_norms(q, k, bundle.head_dim)
             freq_att_last_col[layer_idx, 0, swap_idx] = att_f[0].float()
             freq_logit_norms[layer_idx, swap_idx] = norms_f[0].float().cpu()
@@ -839,9 +869,6 @@ def collect_frequency_scores(
     freq_flat = freq_att_last_col.permute(0, 1, 2, 4, 3, 5).reshape(nl, 1, n_swaps + 1, nf * nh, seq_len)
     scores_f = get_scores(freq_flat, swaps, blocks, tau=tau)
     scores_f = scores_f.squeeze(dim=2).reshape(nl, nf, nh, 2).permute(0, 2, 1, 3).contiguous()
-
-    if attention_matrix is None:
-        raise RuntimeError("Failed to extract full attention matrix for original prompt")
 
     return FrequencyScoreOutputs(
         full_scores=full_scores,
