@@ -407,7 +407,7 @@ def plot_frequency_analysis(
     global_pos = float(full_scores[layer_idx, head_idx, 0])
     global_sym = float(full_scores[layer_idx, head_idx, 1])
 
-    fig = Figure(figsize=(16, 10), constrained_layout=True)
+    fig = plt.figure(figsize=(16, 10), constrained_layout=True)
     gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.3])
 
     ax0 = fig.add_subplot(gs[0, 0])
