@@ -16,4 +16,8 @@ logs/
 HF_token.txt
 
 # Caches
-data
+data/
+notebooks/data/
+
+# Claude utilization
+.claude/

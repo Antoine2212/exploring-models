@@ -1,1 +1,2 @@
-The goal is to look into the heads of gemma 7B. Use `uv sync` to have access to the right dependencies.
+The goal is to look into the heads of Qwen 0.5B. Use `uv sync` in the `exploring-models` folder to have access to the right dependencies.
+You can launch the dashboard to see the figures with `uv run gemma-dashboard`.
