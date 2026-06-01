@@ -10,8 +10,12 @@ def _render_prompt_html(state: DashboardState) -> str:
     rec = state.cache.get_prompt(0)
     text: str = rec.get("text", "")
     tokens: list[str] = list(rec.get("tokens", []))
-    blocks = list(rec.get("blocks", []))
     apply_chat = state.active_apply_chat_template
+
+    # Computation blocks from scores (split_into_blocks), not the single semantic PromptBlock
+    score_blocks: list[tuple[int, int]] = []
+    if state.scores is not None:
+        score_blocks = list(state.scores.get("blocks", []))
 
     mode_badge = (
         '<span style="background:#1f77b4;color:white;padding:2px 8px;border-radius:4px;font-size:0.85em;">chat</span>'
@@ -26,32 +30,27 @@ def _render_prompt_html(state: DashboardState) -> str:
         f"<p><strong>Total tokens:</strong> {len(tokens)}</p>",
     ]
 
-    if blocks:
-        lines.append(f"<h4>Token blocks ({len(blocks)} blocks)</h4>")
+    if score_blocks:
+        lines.append(f"<h4>Computation blocks ({len(score_blocks)} blocks)</h4>")
         lines.append('<table style="border-collapse:collapse;width:100%;font-size:0.9em;">')
         lines.append(
             "<tr>"
             '<th style="border:1px solid #ddd;padding:6px 10px;background:#eee;text-align:left;">Block</th>'
-            '<th style="border:1px solid #ddd;padding:6px 10px;background:#eee;text-align:left;">Name</th>'
             '<th style="border:1px solid #ddd;padding:6px 10px;background:#eee;text-align:right;">Tokens</th>'
             '<th style="border:1px solid #ddd;padding:6px 10px;background:#eee;text-align:right;">Start → End</th>'
             '<th style="border:1px solid #ddd;padding:6px 10px;background:#eee;text-align:left;">Content</th>'
             "</tr>"
         )
-        for i, block in enumerate(blocks):
-            name = getattr(block, "name", f"block_{i}")
-            start = getattr(block, "start", "?")
-            end = getattr(block, "end", "?")
-            block_tokens = getattr(block, "tokens", [])
+        for i, (start, end) in enumerate(score_blocks):
+            block_tokens = tokens[start:end]
             n_tok = len(block_tokens)
             preview = _escape(" ".join(str(t) for t in block_tokens[:20]))
-            if len(block_tokens) > 20:
-                preview += f" … (+{len(block_tokens) - 20})"
+            if n_tok > 20:
+                preview += f" … (+{n_tok - 20})"
             bg = "#fff" if i % 2 == 0 else "#fafafa"
             lines.append(
                 f'<tr style="background:{bg};">'
                 f'<td style="border:1px solid #ddd;padding:5px 10px;">{i}</td>'
-                f'<td style="border:1px solid #ddd;padding:5px 10px;"><code>{_escape(str(name))}</code></td>'
                 f'<td style="border:1px solid #ddd;padding:5px 10px;text-align:right;">{n_tok}</td>'
                 f'<td style="border:1px solid #ddd;padding:5px 10px;text-align:right;">{start} → {end}</td>'
                 f'<td style="border:1px solid #ddd;padding:5px 10px;font-family:monospace;">{preview}</td>'
@@ -59,7 +58,7 @@ def _render_prompt_html(state: DashboardState) -> str:
             )
         lines.append("</table>")
     else:
-        lines.append("<p><em>No block decomposition available for this prompt.</em></p>")
+        lines.append("<p><em>No computation blocks available — run a prompt first.</em></p>")
 
     return "\n".join(lines)
 

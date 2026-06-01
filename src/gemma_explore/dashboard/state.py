@@ -33,10 +33,13 @@ def png_bytes_to_html(png_bytes: bytes) -> str:
 
 
 def _fig_to_png(figure: Figure) -> bytes:
+    import warnings
     import matplotlib.pyplot as plt
     buf = BytesIO()
     try:
-        figure.savefig(buf, format="png", bbox_inches="tight")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Glyph.*missing from font")
+            figure.savefig(buf, format="png", bbox_inches="tight")
         buf.seek(0)
         return buf.getvalue()
     finally:
