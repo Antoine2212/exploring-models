@@ -6,9 +6,9 @@ import panel as pn
 from param.parameterized import Event
 
 from gemma_explore.dashboard import state, widgets
-from gemma_explore.dashboard.views.freq_view import FrequencyView
-from gemma_explore.dashboard.views.head_view import HeadView
-from gemma_explore.dashboard.views.score_view import ScoreView
+from gemma_explore.dashboard.views.freq_view import FreqView
+from gemma_explore.dashboard.views.layer_view import LayerView
+from gemma_explore.dashboard.views.model_view import ModelView
 from gemma_explore.qwen_core import QwenBundle, load_bundle
 
 
@@ -168,9 +168,9 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
         margin=(0, 0, 8, 0),
     )
 
-    head_view = HeadView(dashboard_state, layer_slider, head_slider)
-    score_view = ScoreView(dashboard_state)
-    freq_view = FrequencyView(dashboard_state, layer_slider, head_slider)
+    head_view = LayerView(dashboard_state)
+    score_view = ModelView(dashboard_state)
+    freq_view = FreqView(dashboard_state)
 
     tabs = pn.Tabs(
         ("Head detail", head_view.panel),
@@ -203,7 +203,8 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
         history_controller.widget.disabled = not enabled
 
     def _on_slider_change(_: object) -> None:
-        """Refresh only slider-dependent views."""
+        dashboard_state.selected_layer = layer_slider.value
+        dashboard_state.selected_head = head_slider.value
         head_view.refresh()
         freq_view.refresh()
 
