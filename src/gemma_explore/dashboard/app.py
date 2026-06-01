@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+import numpy as np
 import panel as pn
 from param.parameterized import Event
 
 from gemma_explore.dashboard import state, widgets
+from gemma_explore.dashboard.head_matrix import HeadMatrix
 from gemma_explore.dashboard.views.freq_view import FreqView
+from gemma_explore.dashboard.views.hidden_view import HiddenView
 from gemma_explore.dashboard.views.layer_view import LayerView
 from gemma_explore.dashboard.views.model_view import ModelView
 from gemma_explore.qwen_core import QwenBundle, load_bundle
@@ -16,14 +19,12 @@ HistoryOption = tuple[str, str]
 
 
 def _coerce_prompt_text(value: Any) -> str:
-    """Normalize a prompt-like value to displayable text."""
     if value is None:
         return ""
     return str(value).strip()
 
 
 def _make_prompt_preview(prompt_text: str, max_len: int = 72) -> str:
-    """Create a readable one-line preview label for a prompt."""
     normalized = " ".join(prompt_text.split())
     if len(normalized) <= max_len:
         return normalized
@@ -31,7 +32,6 @@ def _make_prompt_preview(prompt_text: str, max_len: int = 72) -> str:
 
 
 def _extract_history_options(dashboard_state: state.DashboardState) -> list[HistoryOption]:
-    """Build prompt history options from dashboard state while preserving order."""
     prompts = getattr(dashboard_state, "prompt_history", None)
     if prompts is None:
         prompts = getattr(dashboard_state, "history", None)
@@ -69,8 +69,6 @@ def _extract_history_options(dashboard_state: state.DashboardState) -> list[Hist
 
 
 class PromptHistoryController:
-    """Synchronize the prompt history widget with dashboard state."""
-
     def __init__(
         self,
         dashboard_state: state.DashboardState,
@@ -94,7 +92,6 @@ class PromptHistoryController:
         self.sync_from_state(preserve_selection=False)
 
     def sync_from_state(self, preserve_selection: bool = True) -> None:
-        """Refresh widget options from state while avoiding recursive callbacks."""
         current_value = self.widget.value if preserve_selection else None
         active_prompt = _coerce_prompt_text(getattr(self._dashboard_state, "prompt", ""))
         options_list = _extract_history_options(self._dashboard_state)
@@ -114,7 +111,6 @@ class PromptHistoryController:
             self._is_syncing = False
 
     def set_active_prompt(self, prompt_text: str) -> None:
-        """Select the active prompt in the widget if present."""
         normalized_prompt = _coerce_prompt_text(prompt_text)
         if normalized_prompt not in set(self.widget.options.values()):
             self.sync_from_state(preserve_selection=True)
@@ -127,7 +123,6 @@ class PromptHistoryController:
             self._is_syncing = False
 
     def _on_history_selected(self, event: Event) -> None:
-        """Restore a previous prompt from cache without recomputation."""
         if self._is_syncing:
             return
 
@@ -149,17 +144,20 @@ class PromptHistoryController:
             self._prompt_input.value = prompt_text
             self._status_pane.object = "Prompt restored from session history."
             self._refresh_views()
-        except Exception as exc:  # pragma: no cover - UI surface
+        except Exception as exc:
             self._status_pane.object = f"Prompt restore failed: `{exc}`"
             self.sync_from_state(preserve_selection=False)
 
 
+def _extract_score_flat(scores: Any, key: str, num_layers: int, num_heads: int) -> list[float]:
+    raw = scores[key] if isinstance(scores, dict) else getattr(scores, key)
+    arr = np.array(raw, dtype=float).reshape(num_layers, num_heads)
+    return arr.reshape(-1).tolist()
+
+
 def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
-    """Build the dashboard with persistent widgets and views."""
     dashboard_state = state.DashboardState(bundle=bundle)
 
-    layer_slider = widgets.make_layer_slider(bundle.num_layers)
-    head_slider = widgets.make_head_slider(bundle.num_heads)
     prompt_input = widgets.make_prompt_input()
     run_button = widgets.make_run_button()
     status_pane = pn.pane.Markdown(
@@ -168,24 +166,59 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
         margin=(0, 0, 8, 0),
     )
 
-    head_view = LayerView(dashboard_state)
-    score_view = ModelView(dashboard_state)
+    model_view = ModelView(dashboard_state)
+    layer_view = LayerView(dashboard_state)
     freq_view = FreqView(dashboard_state)
+    hidden_view = HiddenView(dashboard_state)
 
     tabs = pn.Tabs(
-        ("Head detail", head_view.panel),
-        ("Scores", score_view.panel),
+        ("Model overview", model_view.panel),
+        ("Layer heads", layer_view.panel),
         ("Frequency", freq_view.panel),
+        ("Hidden states", hidden_view.panel),
         dynamic=True,
         sizing_mode="stretch_both",
         tabs_location="above",
     )
 
-    def _refresh_all_views() -> None:
-        """Refresh all persistent view panes."""
-        head_view.refresh()
-        score_view.refresh()
+    def _on_head_selected(layer: int, head: int) -> None:
+        dashboard_state.selected_layer = layer
+        dashboard_state.selected_head = head
+        layer_view.refresh()
         freq_view.refresh()
+        if tabs.active == 3:
+            hidden_view.refresh()
+
+    matrix = HeadMatrix(
+        num_layers=bundle.num_layers,
+        num_heads=bundle.num_heads,
+        on_select=_on_head_selected,
+    )
+
+    def _update_matrix_scores() -> None:
+        s = dashboard_state
+        if s.scores is None:
+            return
+        nl, nh = bundle.num_layers, bundle.num_heads
+        pos_flat = _extract_score_flat(s.scores, "pos_scores", nl, nh)
+        sym_flat = _extract_score_flat(s.scores, "sym_scores", nl, nh)
+        matrix.update_scores(pos_flat, sym_flat)
+
+    def _refresh_all_views() -> None:
+        model_view.refresh()
+        layer_view.refresh()
+        freq_view.refresh()
+        _update_matrix_scores()
+        if tabs.active == 3:
+            hidden_view.refresh()
+
+    def _on_tab_change(event: Event) -> None:
+        if event.new == 3:
+            hidden_view.activate()
+        else:
+            hidden_view.deactivate()
+
+    tabs.param.watch(_on_tab_change, "active")
 
     history_controller = PromptHistoryController(
         dashboard_state=dashboard_state,
@@ -195,21 +228,11 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
     )
 
     def _set_controls_enabled(enabled: bool) -> None:
-        """Enable or disable interactive controls."""
         prompt_input.disabled = not enabled
         run_button.disabled = not enabled
-        layer_slider.disabled = not enabled
-        head_slider.disabled = not enabled
         history_controller.widget.disabled = not enabled
 
-    def _on_slider_change(_: object) -> None:
-        dashboard_state.selected_layer = layer_slider.value
-        dashboard_state.selected_head = head_slider.value
-        head_view.refresh()
-        freq_view.refresh()
-
     def _on_run(_: object) -> None:
-        """Run the prompt and update existing views in place."""
         prompt_text = prompt_input.value.strip()
         if not prompt_text:
             status_pane.object = "Please enter a prompt."
@@ -228,14 +251,12 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
             else:
                 status_pane.object = "Prompt unchanged; reused cached results."
             _refresh_all_views()
-        except Exception as exc:  # pragma: no cover - UI surface
+        except Exception as exc:
             status_pane.object = f"Run failed: `{exc}`"
         finally:
             run_button.name = "Run"
             _set_controls_enabled(True)
 
-    layer_slider.param.watch(_on_slider_change, "value")
-    head_slider.param.watch(_on_slider_change, "value")
     run_button.on_click(_on_run)
 
     sidebar = pn.Column(
@@ -244,13 +265,10 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
         pn.Spacer(height=8),
         history_controller.widget,
         pn.Spacer(height=8),
-        layer_slider,
-        head_slider,
-        pn.Spacer(height=8),
         status_pane,
-        width=320,
-        min_width=300,
-        max_width=360,
+        width=300,
+        min_width=280,
+        max_width=340,
         sizing_mode="fixed",
     )
 
@@ -259,9 +277,11 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
         sidebar=[sidebar],
         main=[
             pn.Column(
+                matrix.panel,
+                pn.layout.Divider(),
                 tabs,
                 sizing_mode="stretch_both",
-                min_height=700,
+                min_height=900,
             )
         ],
         main_layout=None,
@@ -271,8 +291,7 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
 
 
 def launch_dashboard(bundle: QwenBundle, port: int = 5006, show: bool = True) -> None:
-    """Serve the dashboard."""
-    pn.extension("matplotlib")
+    pn.extension("bokeh")
     app = build_app(bundle).servable()
     pn.serve(app, port=port, show=show)
 

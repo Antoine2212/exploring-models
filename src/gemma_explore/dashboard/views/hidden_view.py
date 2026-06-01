@@ -15,7 +15,7 @@ class HiddenView:
     def __init__(self, state: DashboardState) -> None:
         self._state = state
         self._last_key: tuple = ()
-        self._active: bool = False  # only compute when this tab is visible
+        self._active: bool = False
 
         self._status = pn.pane.Markdown(
             "Activate this tab to compute the hidden-state analysis.",
@@ -32,7 +32,6 @@ class HiddenView:
         )
 
     def activate(self) -> None:
-        """Called when the tab becomes visible."""
         self._active = True
         self.refresh()
 
