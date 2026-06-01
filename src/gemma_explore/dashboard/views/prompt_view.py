@@ -44,7 +44,7 @@ def _render_prompt_html(state: DashboardState) -> str:
         for i, (start, end) in enumerate(score_blocks):
             block_tokens = tokens[start:end]
             n_tok = len(block_tokens)
-            preview = _escape(" ".join(str(t) for t in block_tokens[:20]))
+            preview = _escape(" ".join(_clean_token(str(t)) for t in block_tokens[:20]))
             if n_tok > 20:
                 preview += f" … (+{n_tok - 20})"
             bg = "#fff" if i % 2 == 0 else "#fafafa"
@@ -61,6 +61,11 @@ def _render_prompt_html(state: DashboardState) -> str:
         lines.append("<p><em>No computation blocks available — run a prompt first.</em></p>")
 
     return "\n".join(lines)
+
+
+def _clean_token(token: str) -> str:
+    """Replace tokenizer special glyphs with readable ASCII equivalents."""
+    return token.replace("Ġ", "_").replace("Ċ", "\\n")
 
 
 def _escape(s: str) -> str:
