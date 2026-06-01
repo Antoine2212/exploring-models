@@ -12,6 +12,7 @@ from gemma_explore.dashboard.views.freq_view import FreqView
 from gemma_explore.dashboard.views.hidden_view import HiddenView
 from gemma_explore.dashboard.views.layer_view import LayerView
 from gemma_explore.dashboard.views.model_view import ModelView
+from gemma_explore.dashboard.views.prompt_view import PromptView
 from gemma_explore.qwen_core import QwenBundle, load_bundle
 
 
@@ -124,6 +125,7 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
 
     prompt_input = widgets.make_prompt_input()
     run_button = widgets.make_run_button()
+    chat_toggle = widgets.make_chat_toggle()
     status_pane = pn.pane.Markdown(
         "Enter a prompt and click **Run**.",
         sizing_mode="stretch_width",
@@ -134,12 +136,14 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
     layer_view = LayerView(dashboard_state)
     freq_view = FreqView(dashboard_state)
     hidden_view = HiddenView(dashboard_state)
+    prompt_view = PromptView(dashboard_state)
 
     tabs = pn.Tabs(
         ("Model overview", model_view.panel),
         ("Layer heads", layer_view.panel),
         ("Frequency", freq_view.panel),
         ("Hidden states", hidden_view.panel),
+        ("Prompt overview", prompt_view.panel),
         dynamic=True,
         sizing_mode="stretch_both",
         tabs_location="above",
@@ -172,6 +176,7 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
         model_view.refresh()
         layer_view.refresh()
         freq_view.refresh()
+        prompt_view.refresh()
         _update_matrix_scores()
         if tabs.active == 3:
             hidden_view.refresh()
@@ -194,6 +199,7 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
     def _set_controls_enabled(enabled: bool) -> None:
         prompt_input.disabled = not enabled
         run_button.disabled = not enabled
+        chat_toggle.disabled = not enabled
         history_controller.widget.disabled = not enabled
 
     def _on_run(_: object) -> None:
@@ -207,7 +213,7 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
         status_pane.object = "Running prompt and updating plots..."
 
         try:
-            changed = state.run_prompt(dashboard_state, prompt_text)
+            changed = state.run_prompt(dashboard_state, prompt_text, apply_chat_template=chat_toggle.value)
             history_controller.sync_from_state(preserve_selection=True)
             history_controller.set_active_prompt(prompt_text)
             if changed:
@@ -225,6 +231,7 @@ def build_app(bundle: QwenBundle) -> pn.template.base.BasicTemplate:
 
     sidebar = pn.Column(
         prompt_input,
+        chat_toggle,
         run_button,
         pn.Spacer(height=8),
         history_controller.widget,
