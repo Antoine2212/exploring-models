@@ -12,6 +12,8 @@ Mechanistic interpretability toolkit for analyzing attention heads in Qwen2.5-0.
 
 ## Setup
 
+`uv` is needed for this project. Once installed, you can sync the environment with:
+
 ```bash
 uv sync
 ```
