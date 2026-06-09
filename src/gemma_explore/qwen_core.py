@@ -339,20 +339,29 @@ def build_swap_indices(
     blocks: Sequence[tuple[int, int]],
     swaps: Sequence[tuple[int, int]],
 ) -> torch.Tensor:
-    """Build per-swap token permutations.
+    """Build per-swap token permutations using block rotation.
 
-    If block sizes differ, swap only the common prefix, preserving sequence length.
+    For blocks of unequal size (Li, Lj with delta = Lj - Li), the full segment
+    [si, ej) is rearranged by rotation: bj's tokens go to [si, si+Lj), the
+    middle tokens slide by delta, then bi's tokens close at [sj+delta, ej).
+    This preserves sequence length and avoids leaving any tokens unswapped.
     """
     col_idx = torch.arange(seq_len).unsqueeze(0).expand(len(swaps), -1).clone()
     for k, (bi, bj) in enumerate(swaps):
         si, ei = blocks[bi]
         sj, ej = blocks[bj]
-        li, lj = ei - si, ej - sj
-        lmin = min(li, lj)
-        if lmin == 0:
+        Li = ei - si
+        Lj = ej - sj
+        if Li == 0 or Lj == 0:
             raise ValueError(f"Empty block encountered in swap {(bi, bj)}")
-        col_idx[k, si : si + lmin] = torch.arange(sj, sj + lmin)
-        col_idx[k, sj : sj + lmin] = torch.arange(si, si + lmin)
+        delta = Lj - Li
+        # bj's tokens → [si, si+Lj)
+        col_idx[k, si : si + Lj] = torch.arange(sj, ej)
+        # middle tokens [ei, sj) shift by delta → [si+Lj, sj+delta)
+        if sj > ei:
+            col_idx[k, si + Lj : sj + delta] = torch.arange(ei, sj)
+        # bi's tokens → [sj+delta, ej)
+        col_idx[k, sj + delta : ej] = torch.arange(si, ei)
     return col_idx
 
 
@@ -645,11 +654,21 @@ def get_scores(
 
     perms = perms.permute(0, 1, 3, 2, 4)
 
+    # Dynamic block intervals after rotation: new block bi spans [si, si+Lj),
+    # new block bj spans [sj+delta, ej), middle blocks shift by delta but keep
+    # their original labels (mapped back via token_to_block[pos - delta]).
     permuted_block_ids = token_to_block.unsqueeze(0).expand(n_swaps, -1).clone()
-    bi = swaps_t[:, 0].unsqueeze(1)
-    bj = swaps_t[:, 1].unsqueeze(1)
-    permuted_block_ids = torch.where(permuted_block_ids == bi, bj, permuted_block_ids)
-    permuted_block_ids = torch.where(permuted_block_ids == bj, bi, permuted_block_ids)
+    for k_idx, (bi_k, bj_k) in enumerate(swaps):
+        si, ei = blocks[bi_k]
+        sj, ej = blocks[bj_k]
+        Li = ei - si
+        Lj = ej - sj
+        delta = Lj - Li
+        permuted_block_ids[k_idx, si : si + Lj] = bi_k
+        if sj > ei:
+            orig_mid = torch.arange(ei, sj, device=device)
+            permuted_block_ids[k_idx, si + Lj : sj + delta] = token_to_block[orig_mid]
+        permuted_block_ids[k_idx, sj + delta : ej] = bj_k
 
     idx_perm = permuted_block_ids.view(1, 1, 1, n_swaps, seq_len).expand(nl, ns, nh, -1, -1)
     block_sum_perm = torch.zeros(nl, ns, nh, n_swaps, m, device=device, dtype=perms.dtype)
